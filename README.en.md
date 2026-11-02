@@ -151,7 +151,7 @@ devrelay run 12 --submit    # Then deliver under the project policy
 devrelay resume 12          # Resume the saved DevRelay implementation session
 ```
 
-`run` handles one task, recovering interrupted work first when no ID is given; failed or blocked work returns `needs_attention` until explicitly addressed. Codex implements in `.devrelay/worktrees/ID`; DevRelay runs configured checks. Failed checks feed back into the same saved Codex session within `max_attempts`. External blockers are retained.
+`run` handles one task, recovering interrupted work first when no ID is given; failed or blocked work returns `needs_attention` until explicitly addressed. Codex implements in `.devrelay/worktrees/ID`; DevRelay runs configured checks. Failed checks feed back into the same saved Codex session within `max_attempts`. External blockers are retained. All execution entry points exit 1 for failed, blocked, rejected-review or `needs_attention` results. An empty `idle` queue, delivered PR and `merge_waiting` without blockers exit 0; a waiting merge with explicit blockers exits 1.
 
 Do not let no-ID `run` or `watch` take over tasks still being edited by an external agent. Stop the previous executor and inspect the worktree before switching modes. Both paths use the same authorization, dependency, verification and delivery gates; an agent report does not replace current verification evidence.
 

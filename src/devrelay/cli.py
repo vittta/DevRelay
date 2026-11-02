@@ -17,7 +17,7 @@ from .process import interrupt_on_sigterm
 from .providers import add_local, queue_report, snapshot
 from .runner import complete_local, prepare_task, run_task, start, submit, verify
 from .state import State
-from .worker import watch
+from .worker import ATTENTION, watch
 
 
 def parser():
@@ -134,6 +134,13 @@ def main(argv=None):
         return _dispatch(args)
 
 
+def result_exit_code(result):
+    attention = result.get("status") in ATTENTION | {"needs_attention"}
+    blocked_merge = (result.get("status") == "merge_waiting"
+                     and bool(result.get("merge_gates", {}).get("blockers")))
+    return 1 if attention or blocked_merge or result.get("ready") is False else 0
+
+
 def _dispatch(args):
     state = None
     try:
@@ -141,7 +148,7 @@ def _dispatch(args):
             from .workspace import dispatch
             result = dispatch(args)
             print(json.dumps(result, indent=2, ensure_ascii=False))
-            return 1 if result.get("status") in ("failed", "blocked", "needs_attention") or result.get("ready") is False else 0
+            return result_exit_code(result)
         if args.command == "task" and args.task_command == "revoke":
             raise RelayError("task revoke requires --workspace")
         root = repository_root(args.project)
@@ -165,7 +172,7 @@ def _dispatch(args):
             if args.command == "doctor":
                 result = doctor(config, with_codex=args.with_codex)
                 print(json.dumps(result, indent=2, ensure_ascii=False))
-                return 0 if result["ready"] else 1
+                return result_exit_code(result)
             elif args.command in ("status", "task") and (args.command == "status" or args.task_command == "list"):
                 result = {"project": str(root), "tasks": state.tasks()}
             elif args.command == "next":
@@ -174,7 +181,7 @@ def _dispatch(args):
                 result = watch(config, state, poll_interval=args.poll_interval, max_tasks=args.max_tasks,
                                emit=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True))
                 print(json.dumps(result, ensure_ascii=False), flush=True)
-                return 1 if result["status"] == "needs_attention" else 0
+                return result_exit_code(result)
             else:
                 with state.lock():
                     if args.command == "task" and args.task_command == "add":
@@ -196,7 +203,7 @@ def _dispatch(args):
                     else:
                         result = run_task(config, state, args.id, resume=args.command == "resume", submit_after=args.submit)
         print(json.dumps(result, indent=2, ensure_ascii=False))
-        return 0
+        return result_exit_code(result)
     except (RelayError, OSError) as error:
         print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 1

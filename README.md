@@ -157,7 +157,7 @@ devrelay run 12 --submit    # 再按项目策略交付
 devrelay resume 12          # 恢复 DevRelay 保存的实现会话
 ```
 
-`run` 每次只处理一个任务。无 ID 时优先恢复中断任务；已有失败或阻塞任务时返回 `needs_attention`，由维护者检查并明确恢复后再派发新任务。Codex 在 `.devrelay/worktrees/ID` 实现，DevRelay 执行验收。检查失败时，在配置的 `max_attempts` 范围内把失败信息交给相同 Codex 会话修复。Codex 报告外部阻塞时保存阻塞状态。不要用无 ID 的 `run` 或 `watch` 接管仍由外层 Agent 编辑的任务；切换前应先停止原执行者并检查现场。
+`run` 每次只处理一个任务。无 ID 时优先恢复中断任务；已有失败或阻塞任务时返回 `needs_attention`，由维护者检查并明确恢复后再派发新任务。Codex 在 `.devrelay/worktrees/ID` 实现，DevRelay 执行验收。检查失败时，在配置的 `max_attempts` 范围内把失败信息交给相同 Codex 会话修复。Codex 报告外部阻塞时保存阻塞状态。所有执行入口对失败、阻塞、审查拒绝或 `needs_attention` 结果返回退出码 1；空队列 `idle`、已交付 PR 和没有阻塞项的 `merge_waiting` 返回 0，等待合并时有明确阻塞项则返回 1。不要用无 ID 的 `run` 或 `watch` 接管仍由外层 Agent 编辑的任务；切换前应先停止原执行者并检查现场。
 
 ### 持续自动领取 Issues
 
