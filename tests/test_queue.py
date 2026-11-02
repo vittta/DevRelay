@@ -121,6 +121,7 @@ class QueueTests(RepositoryTest):
 
     def test_github_integration_uses_actual_base_ancestry(self):
         self.config = self.configure(provider="github")
+        self.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
         base = self.git("rev-parse", "HEAD")
         self.git("update-ref", "refs/remotes/origin/main", base)
         (self.root / "value.txt").write_text("unmerged\n")
