@@ -37,3 +37,20 @@ class BaseRefTests(GitHubDeliveryFixture):
         self.advance_remote_base()
         with self.assertRaisesRegex(RelayError, "no fetch tracking mapping"):
             base_commit(self.config)
+
+    def test_explicit_base_fetch_updates_mapping_despite_negative_selection(self):
+        stale = self.git("rev-parse", "origin/main")
+        self.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/custom/*")
+        self.git("config", "--add", "remote.origin.fetch", "^refs/heads/main")
+        latest = self.advance_remote_base()
+        self.git("update-ref", "refs/remotes/custom/main", stale)
+        self.assertEqual(base_commit(self.config), latest)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/custom/main"), latest)
+        self.assertEqual(self.git("rev-parse", "FETCH_HEAD"), latest)
+
+    def test_missing_fetch_configuration_never_uses_stale_origin_reference(self):
+        self.git("config", "--unset-all", "remote.origin.fetch")
+        latest = self.advance_remote_base()
+        with self.assertRaisesRegex(RelayError, "no fetch tracking mapping"):
+            base_commit(self.config)
+        self.assertEqual(self.git("rev-parse", "FETCH_HEAD"), latest)
