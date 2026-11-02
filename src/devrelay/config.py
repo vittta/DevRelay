@@ -8,7 +8,7 @@ import re
 import tomllib
 
 from .errors import RelayError
-from .git import git, github_slug, has_ref
+from .git import git, github_slug, has_ref, remote_tracking_ref
 
 
 @dataclass(frozen=True)
@@ -39,7 +39,13 @@ class Config:
 
     @property
     def base_ref(self):
-        return f"{self.remote}/{self.base}" if self.provider == "github" else self.base
+        if self.provider != "github":
+            return "refs/heads/" + self.base
+        ref = remote_tracking_ref(self.root, self.remote, self.base)
+        if ref is None:
+            raise RelayError(f"Base {self.base} has no fetch tracking mapping for remote {self.remote}; "
+                             "configure a positive fetch refspec before using this project")
+        return ref
 
 
 def _table(data, name):
