@@ -7,6 +7,8 @@ import sys
 from unittest.mock import patch
 
 from devrelay.cli import main
+from devrelay.errors import RelayError
+from devrelay.process import execute
 from devrelay.providers import add_local
 from devrelay.runner import start
 from devrelay.state import group_alive
@@ -90,3 +92,57 @@ class CliCancellationTests(RepositoryTest):
         with patch("devrelay.cli.load", side_effect=KeyboardInterrupt), patch("builtins.print"):
             self.assertEqual(main(["--project", str(self.root), "status"]), 130)
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_interruption_before_process_marker_is_saved_still_stops_command(self):
+        self.configure()
+        save = self.state.set_metadata
+        group = None
+
+        def interrupt_first_marker(key, value):
+            nonlocal group
+            if key == "active_process" and value is not None and group is None:
+                group = value["group"]
+                raise KeyboardInterrupt
+            return save(key, value)
+
+        with patch.object(self.state, "set_metadata", side_effect=interrupt_first_marker):
+            with self.assertRaises(KeyboardInterrupt):
+                execute(self.state, [sys.executable, "-c", "import time; time.sleep(30)"],
+                        self.root, self.state.directory / "interrupted-start.log", 10)
+        self.assertIsNotNone(group)
+        self.assertFalse(group_alive(group))
+        self.assertIsNone(self.state.metadata("active_process"))
+
+    def test_failed_startup_cancellation_retains_process_group_marker(self):
+        self.configure()
+        save = self.state.set_metadata
+        interrupted = False
+        process = None
+
+        def interrupt_first_marker(key, value):
+            nonlocal interrupted
+            if key == "active_process" and value is not None and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return save(key, value)
+
+        def fail_termination(command):
+            nonlocal process
+            process = command
+            raise RelayError("Cannot stop process group")
+
+        try:
+            with patch.object(self.state, "set_metadata", side_effect=interrupt_first_marker):
+                with patch("devrelay.process.terminate", side_effect=fail_termination):
+                    with self.assertRaisesRegex(RelayError, "Cannot stop process group"):
+                        execute(self.state, [sys.executable, "-c", "import time; time.sleep(30)"],
+                                self.root, self.state.directory / "failed-start-cancellation.log", 10)
+            self.assertEqual(self.state.metadata("active_process")["group"], process.pid)
+            self.assertTrue(group_alive(process.pid))
+            with self.assertRaisesRegex(RelayError, "Previous command still runs"):
+                with self.state.lock():
+                    self.fail("The interrupted startup must keep recovery blocked")
+        finally:
+            if process is not None:
+                process.kill()
+                process.wait(timeout=5)

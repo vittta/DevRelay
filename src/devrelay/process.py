@@ -109,27 +109,30 @@ def execute(state, argv, cwd, log, timeout, *, input=None, env=None, on_output_l
             except OSError as error:
                 raise RelayError(f"Cannot start {argv[0]}: {error}") from error
             state.set_metadata("active_process", {"group": process.pid, "argv": argv, "started_at": now()})
+            if on_output_line is None:
+                process.communicate(input, timeout=timeout)
+            else:
+                timed_out = _stream_output(process, log, timeout, started, input, on_output_line)
+                if timed_out:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
             try:
-                if on_output_line is None:
-                    process.communicate(input, timeout=timeout)
-                else:
-                    timed_out = _stream_output(process, log, timeout, started, input, on_output_line)
-                    if timed_out:
-                        raise subprocess.TimeoutExpired(argv, timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    terminate(process)
-                except BaseException:
-                    termination_failed = True
-                    raise
+                terminate(process)
             except BaseException:
-                try:
-                    terminate(process)
-                except BaseException:
-                    termination_failed = True
-                    raise
+                termination_failed = True
                 raise
+        except BaseException:
+            if process is not None:
+                try:
+                    state.set_metadata("active_process", {"group": process.pid, "argv": argv, "started_at": now()})
+                finally:
+                    try:
+                        terminate(process)
+                    except BaseException:
+                        termination_failed = True
+                        raise
+            raise
         finally:
             if diagnostics is not None:
                 diagnostics.close()
