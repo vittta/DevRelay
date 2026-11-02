@@ -98,11 +98,11 @@ def _submodule_heads(root, paths):
     return heads
 
 
-def _submodule_content_matches_head(root):
+def _content_matches_tree(root, tree):
     algorithm = _evidence_git(root, "rev-parse", "--show-object-format")
     if algorithm not in ("sha1", "sha256"):
-        raise RelayError("Unsupported Git object format for submodule evidence")
-    for entry in _evidence_git(root, "ls-tree", "-r", "-z", "HEAD", text=False).split(b"\0"):
+        raise RelayError("Unsupported Git object format for source evidence")
+    for entry in _evidence_git(root, "ls-tree", "-r", "-z", tree, text=False).split(b"\0"):
         if not entry:
             continue
         metadata, _, path = entry.partition(b"\t")
@@ -115,7 +115,7 @@ def _submodule_content_matches_head(root):
             try:
                 link_target = os.readlink(os.fsencode(target))
             except OSError as error:
-                raise RelayError(f"Cannot read submodule symlink {path}: {error}") from error
+                raise RelayError(f"Cannot read source symlink {path}: {error}") from error
             digest = hashlib.new(algorithm, usedforsecurity=False)
             digest.update(b"blob " + str(len(link_target)).encode() + b"\0" + link_target)
             if digest.hexdigest().encode() != object_id:
@@ -143,10 +143,14 @@ def _submodule_content_matches_head(root):
                 if count != metadata.st_size:
                     return False
         except OSError as error:
-            raise RelayError(f"Cannot hash raw submodule source {path}: {error}") from error
+            raise RelayError(f"Cannot hash raw source {path}: {error}") from error
         if digest.hexdigest().encode() != object_id:
             return False
     return True
+
+
+def _submodule_content_matches_head(root):
+    return _content_matches_tree(root, "HEAD")
 
 
 def _submodule_snapshot(root, paths, prefix=Path(), seen=None):
@@ -204,6 +208,13 @@ def _isolated_source_tree(root, *, inspect_submodules, neutralize_config=False):
         if inspect_submodules:
             _evidence_git(root, "diff", "--cached", "--check", env=env, text=False)
         tree = _evidence_git(root, "write-tree", env=env)
+        if inspect_submodules and not _content_matches_tree(root, tree):
+            raise RelayError(
+                "Working source differs from deliverable Git blobs; verification requires identical "
+                "file bytes and symlink types. Use a checkout without byte-changing clean/smudge "
+                "filters, line-ending normalization or working-tree encoding conversion. "
+                "The worktree and original index were left unchanged"
+            )
         if inspect_submodules and _clean_submodule_snapshot(root, paths) != submodules:
             raise RelayError("Submodule HEAD changed while creating source evidence; rerun verification")
         return tree

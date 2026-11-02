@@ -252,6 +252,7 @@ devrelay submit fix-1 --local
 ## 验证与恢复
 
 - 验证绑定源码树、HEAD、目标 base、项目配置和任务要求。源码哈希包括已跟踪修改与未忽略新文件，使用临时 Git 索引，保留原索引。
+- 主仓库验收要求纳入源码的普通文件原始字节、符号链接类型和目标与即将交付的 Git tree 一致；隔离索引仍使用 Git 的正常转换规则。保持字节不变的 filters 可用。会改变字节的 clean/smudge filters、CRLF 规范化或 `working-tree-encoding` 转换会在验收前明确阻止操作，保留工作树与原索引；请使用与交付 blob 字节一致的 checkout 再验收。DevRelay 不自动改写文件或绕过合法转换来提交另一种内容。
 - 所有源码证据 Git 操作均禁用本地 replacement refs，检查实际提交对象，不修改用户的替换引用。NUL 分隔的文件路径按字节解析，支持文件系统可表示的非 UTF-8 和含回车的文件名。
 - 对已检出的子模块递归检查已跟踪修改和未忽略的新文件；隔离索引比较会忽略 `assume-unchanged`、`skip-worktree` 与 `core.fileMode=false` 等掩码，并覆盖 `submodule.*.ignore`、`.gitmodules` ignore 和隐藏未跟踪文件的状态配置。任一子模块不干净都会使验收、提交及自动审查/合并门禁失败，且 DevRelay 不会提交、清理、重置或更新子模块。
 - 子模块未跟踪文件检测只应用 `.gitignore`，不会读取本地 `info/exclude` 或 `core.excludesFile`。检测与隔离索引比较强制使用 `core.ignoreCase=false`，因此 `build/` 等规则不能隐藏 `BuIlD/undelivered.txt`，且不修改用户配置。已暂存内容使用只读索引比较，生成源码证据时不重建真实子模块索引的缓存树，也禁用可选的索引刷新写入。
