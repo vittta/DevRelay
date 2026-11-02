@@ -43,7 +43,9 @@ class WorkerFixture(GitHubDeliveryFixture):
         identifier = argv[2].rsplit("/", 1)[1]
         task = self.state.get(identifier)
         return {"url": self.pulls[identifier]["url"], "state": "OPEN", "headRefName": task["branch"],
-                "headRefOid": task["head_sha"], "baseRefName": "main"}
+                "headRefOid": self.git("--git-dir", str(self.remote), "rev-parse", task["branch"]),
+                "baseRefName": "main", "isCrossRepository": False,
+                "autoMergeRequest": None}
 
     def pull_write(self, config, *argv, input=None):
         if argv[1] != "create":

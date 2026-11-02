@@ -82,6 +82,8 @@ devrelay --project /path/to/project submit 12
 
 已有本地提交或未合并 PR 的任务可以重新 `prepare`，再 `check/submit`，继续使用原分支与 PR。对已有 PR 会回读仓库、状态、head 与 base；已关闭、已合并、正在合并或身份不符时拒绝准备，保留现场并转入交付恢复。环境配置改变后，应先把最新目标分支集成到任务分支。`submit` 在提交、推送、PR 发布和回读边界重新比较任务标题、正文、授权、源码、配置与 base；观察到变化即停止，保留已发生的提交、推送及已回读的 PR 身份，重新验收后恢复，不自动回滚。
 
+`submit` 在本地提交和推送前按已保存 URL 核对原 PR 的仓库、开放状态、head、base 与待合并请求；关闭或身份变化会阻止继续发布。PR 创建超时后会查询该分支的全部状态，保留找到的原 PR，不自动创建替代 PR。已发布 HEAD、推送意图和最后一次 PR 回读保存在任务记录中；推送超时后允许回读已记录的新旧 HEAD，确认原 PR 状态后再恢复。
+
 外层 Agent 的会话、计划、实验预算及工作树编辑期间的独占由外层负责。DevRelay 的单 worker 锁只覆盖工具命令执行，不覆盖两次调用之间的编辑；不要同时为该仓库启动 `watch`。恢复时先查看 `status` 和实际工作树，再继续编辑或重试工具。`resume` 专用于可选的 DevRelay Codex 编排，不能恢复外层 Agent 的会话。
 
 `doctor` 默认检查工程工具，并检查已配置的 AI 交付依赖；启用了 `auto_review` 或 `auto_merge` 时仍要求 Codex。使用可选编排或显式 `review` 前运行 `doctor --with-codex`。完整操作约定见 [Agent 工作流](docs/agent-workflow.md)。
