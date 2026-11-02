@@ -1,4 +1,5 @@
 from contextlib import ExitStack
+import json
 from pathlib import Path
 import subprocess
 import unittest
@@ -27,6 +28,8 @@ class GitHubDeliveryFixture(RepositoryTest):
         self.edit_count = 0
         self.timeout_after_create = False
         self.readback_head = None
+        self.submission_queue = None
+        self.submission_auto_merge = None
         self.last_body = ""
         self.create_argv = ()
         stack = ExitStack()
@@ -39,6 +42,7 @@ class GitHubDeliveryFixture(RepositoryTest):
         stack.enter_context(patch("devrelay.providers.gh_json", side_effect=self.inventory))
         stack.enter_context(patch("devrelay.runner.gh_json", side_effect=self.pull_read))
         stack.enter_context(patch("devrelay.runner.gh", side_effect=self.pull_write))
+        stack.enter_context(patch("devrelay.runner.command", side_effect=self.submission_gates))
 
     def inventory(self, config, *argv):
         if argv[0] == "issue":
@@ -54,6 +58,17 @@ class GitHubDeliveryFixture(RepositoryTest):
                 "headRefName": task["branch"],
                 "headRefOid": self.readback_head or self.git("--git-dir", str(self.remote), "rev-parse", task["branch"]), "baseRefName": "main",
                 "isCrossRepository": False, "autoMergeRequest": None}
+
+    def submission_gates(self, argv, cwd):
+        self.assertEqual(argv[:5], ["gh", "api", "--hostname", "github.com", "graphql"])
+        self.assertIn("owner=example", argv)
+        self.assertIn("name=project", argv)
+        self.assertIn("mergeQueueEntry{id}", argv[argv.index("-f") + 1])
+        number = next(argument.removeprefix("number=") for argument in argv if argument.startswith("number="))
+        return json.dumps({"data": {"repository": {"pullRequest": {
+            "url": "https://github.com/example/project/pull/" + number,
+            "mergeQueueEntry": self.submission_queue, "autoMergeRequest": self.submission_auto_merge,
+        }}}})
 
     def pull_write(self, config, *argv, input=None):
         self.last_body = input
@@ -227,6 +242,73 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
                 submit(self.config, self.state, "12")
         self.assertEqual(self.state.get("12")["pr_url"], "https://github.com/example/project/pull/1")
         self.assertEqual(self.create_count, 1)
+
+    def test_external_merge_queue_blocks_publication_without_a_local_merge_request(self):
+        self.implement()
+        with self.state.lock():
+            original = submit(self.config, self.state, "12")
+            path = Path(original["worktree"])
+            (path / "new.txt").write_text("queued PR changes\n")
+            verify(self.config, self.state, "12")
+            self.submission_queue = {"id": "external-queue-entry"}
+            with self.assertRaisesRegex(RelayError, "closed/merged/pending"):
+                submit(self.config, self.state, "12")
+        saved = self.state.get("12")
+        self.assertEqual(saved["pr_url"], original["pr_url"])
+        self.assertEqual(saved["status"], "blocked")
+        self.assertEqual(saved["pr_observation"]["merge"]["data"]["repository"]["pullRequest"]["mergeQueueEntry"],
+                         self.submission_queue)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=path), original["head_sha"])
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", original["branch"]), original["head_sha"])
+        self.assertEqual((self.create_count, self.edit_count), (1, 0))
+
+    def test_incomplete_graphql_merge_state_blocks_publication_and_retains_pr_identity(self):
+        self.implement()
+        with self.state.lock():
+            original = submit(self.config, self.state, "12")
+        valid = {"url": original["pr_url"], "mergeQueueEntry": None, "autoMergeRequest": None}
+        invalid = ["invalid json", "[]", json.dumps({"errors": [{"message": "Unavailable"}]}),
+                   json.dumps({"data": {"repository": {"pullRequest": None}}})]
+        for change in ({"url": "https://github.com/other/repo/pull/1"},
+                       {"mergeQueueEntry": {"id": ""}}, {"autoMergeRequest": {"enabledAt": 0}}):
+            invalid.append(json.dumps({"data": {"repository": {"pullRequest": {**valid, **change}}}}))
+        invalid.append(json.dumps({"data": {"repository": {"pullRequest": {"url": original["pr_url"]}}}}))
+        for response in invalid:
+            with self.subTest(response=response), self.state.lock():
+                verify(self.config, self.state, "12")
+                with patch("devrelay.runner.command", return_value=response):
+                    with self.assertRaisesRegex(RelayError, "incomplete or invalid PR merge state"):
+                        submit(self.config, self.state, "12")
+                self.assertEqual(self.state.get("12")["pr_url"], original["pr_url"])
+                self.assertEqual(self.state.get("12")["status"], "blocked")
+                self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", original["branch"]), original["head_sha"])
+        self.assertEqual((self.create_count, self.edit_count), (1, 0))
+
+    def test_authorization_changed_during_pre_push_pr_readback_blocks_push(self):
+        self.implement()
+        with self.state.lock():
+            original = submit(self.config, self.state, "12")
+            path = Path(original["worktree"])
+            (path / "new.txt").write_text("new implementation\n")
+            verify(self.config, self.state, "12")
+        reads = 0
+
+        def withdraw_during_readback(argv, cwd):
+            nonlocal reads
+            result = self.submission_gates(argv, cwd)
+            reads += 1
+            if reads == 2:
+                self.issue["labels"] = [{"name": "priority:P1"}]
+            return result
+
+        with self.state.lock(), patch("devrelay.runner.command", side_effect=withdraw_during_readback):
+            with self.assertRaisesRegex(RelayError, "not eligible"):
+                submit(self.config, self.state, "12")
+        saved = self.state.get("12")
+        self.assertNotEqual(saved["head_sha"], original["head_sha"])
+        self.assertEqual(saved["pr_url"], original["pr_url"])
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", original["branch"]), original["head_sha"])
+        self.assertEqual((self.create_count, self.edit_count), (1, 0))
 
     def test_requirements_changed_during_commit_block_push_and_can_be_revalidated(self):
         task = self.implement()

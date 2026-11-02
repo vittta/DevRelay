@@ -8,7 +8,7 @@ import uuid
 from . import codex
 from .config import load
 from .errors import RelayError
-from .git import (git, has_ref, is_ancestor, pinned_transport, remote_tracking_ref,
+from .git import (command, git, has_ref, is_ancestor, pinned_transport, remote_tracking_ref,
                   source_tree, stage_submodule_gitlinks, validate_remote, worktrees)
 from .process import execute
 from .providers import authorized, gh, gh_json, queue_report, snapshot, task_id
@@ -283,6 +283,35 @@ def run_task(config, state, identifier=None, *, resume=False, submit_after=False
         raise
 
 
+SUBMISSION_QUERY = """query($owner:String!,$name:String!,$number:Int!){
+ repository(owner:$owner,name:$name){pullRequest(number:$number){
+  url mergeQueueEntry{id} autoMergeRequest{enabledAt}
+ }}
+}"""
+
+
+def submission_merge_state(config, state, task, number):
+    owner, name = config.repo.split("/")
+    raw = command(["gh", "api", "--hostname", "github.com", "graphql", "-f", "query=" + SUBMISSION_QUERY,
+                   "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=" + number], config.root)
+    try:
+        response = json.loads(raw)
+        task["pr_observation"]["merge"] = response
+        state.save(task)
+        if response.get("errors"):
+            raise ValueError("GraphQL errors")
+        pull = response["data"]["repository"]["pullRequest"]
+        if not isinstance(pull, dict) or pull["url"].casefold() != task["pr_url"].casefold():
+            raise ValueError("PR identity")
+        for key, field in (("mergeQueueEntry", "id"), ("autoMergeRequest", "enabledAt")):
+            value = pull[key]
+            if value is not None and (not isinstance(value, dict) or not isinstance(value[field], str) or not value[field]):
+                raise ValueError(key)
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RelayError("GitHub returned incomplete or invalid PR merge state; preserve delivery and inspect GitHub") from error
+    return pull
+
+
 def submission_pull(config, state, task, *, heads=None):
     if not task.get("pr_url"):
         pulls = gh_json(config, "pr", "list", "--head", task["branch"],
@@ -305,6 +334,7 @@ def submission_pull(config, state, task, *, heads=None):
         if not isinstance(pull, dict) or any(not isinstance(pull.get(key), str) for key in
                 ("url", "state", "headRefName", "headRefOid", "baseRefName")):
             raise RelayError("GitHub returned incomplete PR identity; preserve delivery and inspect GitHub")
+        merge_state = submission_merge_state(config, state, task, match[2])
         allowed = heads if heads is not None else {task.get("published_head", task.get("head_sha"))}
         intent = task.get("push_intent")
         if heads is None and intent and intent["previous_sha"] in allowed:
@@ -313,6 +343,7 @@ def submission_pull(config, state, task, *, heads=None):
                 or pull.get("headRefName") != task["branch"] or pull.get("headRefOid") not in allowed - {None}
                 or pull.get("baseRefName") != config.base or pull.get("isCrossRepository") is not False
                 or "autoMergeRequest" not in pull or pull["autoMergeRequest"] is not None
+                or merge_state["mergeQueueEntry"] is not None or merge_state["autoMergeRequest"] is not None
                 or task.get("merge_request")):
             raise RelayError("PR readback differs from the saved submission or is closed/merged/pending; preserve delivery and inspect GitHub")
     except RelayError as error:
@@ -368,8 +399,8 @@ def submit(config, state, identifier, *, local=False):
     state.save(task)
     if local:
         return task
-    submission_evidence(config, state, task, record, head=head)
     submission_pull(config, state, task)
+    submission_evidence(config, state, task, record, head=head)
     push_url = validate_remote(config, path)
     ref = "refs/heads/" + task["branch"]
     # Pin the exact validated endpoint in the transport invocation. A remote
