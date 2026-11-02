@@ -142,7 +142,7 @@ devrelay submit 12
 
 远程指向其他仓库时，错误会指出 fetch 或 push URL，并包含 `does not match project.repository`；修正该远程后再重试 GitHub 操作。
 
-推送后的跟踪引用更新和跟踪引用清理使用首个匹配的正 fetch refspec。负 fetch refspec 仅限制抓取，不会取消这一跟踪映射。
+目标基线、推送后的跟踪引用更新和跟踪引用清理使用首个匹配的正 fetch refspec。目标分支必须有正 fetch 映射；没有映射时停止并要求修正配置，不回退到旧的 `origin/main` 等引用。负 fetch refspec 仅限制抓取，不会取消这一跟踪映射。
 
 传输保留 Git 对 `GIT_CONFIG_NOSYSTEM` 的布尔值规则：`0`/`false` 保留原有系统设置，`1`/`true` 禁用它们。其他 Git 布尔值写法同样支持；无效值会停止传输。
 
