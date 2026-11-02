@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from devrelay.errors import RelayError
-from devrelay.providers import Snapshot, dependencies, gh, linked_ids, queue_report, snapshot, task_id
+from devrelay.providers import Snapshot, closing_ids, dependencies, gh, linked_ids, queue_report, snapshot, task_id
 
 from helpers import RepositoryTest
 
@@ -92,7 +92,59 @@ class QueueTests(RepositoryTest):
 
     def test_pr_refs_do_not_confuse_dependency_mentions(self):
         pull = {"headRefName": "fix/other", "body": "Refs #12, #27\nDepends on: #99"}
-        self.assertEqual(linked_ids(pull, self.config.prefix), {"12", "27"})
+        self.assertEqual(linked_ids(pull, self.config.prefix, self.config.repo), {"12", "27"})
+
+    def test_closing_references_bind_the_repository_and_issue_number(self):
+        references = [
+            {"number": 12, "url": "https://github.com/other/repo/issues/12"},
+            {"number": 13, "url": "https://github.com/EXAMPLE/Project/issues/13"},
+            {"number": 14},
+            {"number": 15, "url": "https://github.com/example/project/issues/16"},
+            {"number": 17, "url": "https://github.example/example/project/issues/17"},
+            {"number": 18, "url": "https://github.com/example/project/pull/18"},
+        ]
+        self.assertEqual(closing_ids({"closingIssuesReferences": references}, self.config.repo), {"13"})
+
+    def test_open_pr_cross_repository_closing_reference_does_not_claim_local_issue(self):
+        pull = {"headRefName": "fix/unrelated", "body": "Fixes other/repo#12\nRefs #13",
+                "closingIssuesReferences": [
+                    {"number": 12, "url": "https://github.com/other/repo/issues/12"},
+                    {"number": 14, "url": "https://github.com/example/project/issues/14"},
+                ]}
+        self.assertEqual(linked_ids(pull, self.config.prefix, self.config.repo), {"13", "14"})
+        pull["headRefName"] = self.config.prefix + "15"
+        self.assertEqual(linked_ids(pull, self.config.prefix, self.config.repo), {"13", "14", "15"})
+
+    def test_cross_repository_merge_does_not_unlock_a_local_dependency(self):
+        self.config = self.configure(provider="github")
+        base = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/main", base)
+        issues = [{"number": identifier, "title": "Task", "body": body, "state": state,
+                   "labels": [{"name": "auto:approved"}, {"name": "priority:P1"}],
+                   "url": f"https://github.com/example/project/issues/{identifier}",
+                   "createdAt": "2026-10-09T00:00:00Z"}
+                  for identifier, body, state in ((12, "Depends on: none", "CLOSED"),
+                                                   (13, "Depends on: #12", "OPEN"))]
+        pull = {"state": "MERGED", "baseRefName": "main", "mergeCommit": {"oid": base},
+                "closingIssuesReferences": [{"number": 12, "url": "https://github.com/other/repo/issues/12"}]}
+        from devrelay import providers
+        real_git = providers.git
+        def offline_git(root, *argv):
+            return "" if argv[0] == "fetch" else real_git(root, *argv)
+        for repository, expected in (("other/repo", set()), ("example/project", {"12"})):
+            with self.subTest(repository=repository):
+                pull["closingIssuesReferences"][0]["url"] = f"https://github.com/{repository}/issues/12"
+                with (patch.object(providers, "git", side_effect=offline_git),
+                      patch.object(providers, "validate_remote"),
+                      patch.object(providers, "gh_json", side_effect=[issues, [pull]])):
+                    view = snapshot(self.config, self.state)
+                self.assertEqual(view.integrated, expected)
+                report = queue_report(self.config, view)
+                if expected:
+                    self.assertEqual(report["selected"]["id"], "13")
+                else:
+                    self.assertIsNone(report["selected"])
+                    self.assertIn("Dependency #12 is not closed and integrated", str(report["excluded"]))
 
     def test_github_command_pins_the_host_instead_of_inheriting_gh_host(self):
         with patch("devrelay.providers.command", return_value="[]") as called:
@@ -127,7 +179,8 @@ class QueueTests(RepositoryTest):
         self.git("commit", "-qam", "unmerged")
         unmerged = self.git("rev-parse", "HEAD")
         pulls = [{"state": "MERGED", "baseRefName": "main", "mergeCommit": {"oid": oid},
-                  "closingIssuesReferences": [{"number": number}]} for number, oid in ((1, base), (2, unmerged))]
+                  "closingIssuesReferences": [{"number": number,
+                                                "url": f"https://github.com/example/project/issues/{number}"}]} for number, oid in ((1, base), (2, unmerged))]
         from devrelay import providers
         real_git = providers.git
         def offline_git(root, *argv):

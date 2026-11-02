@@ -47,8 +47,19 @@ def dependencies(body, *, github=False):
     return identifiers
 
 
-def linked_ids(pull, prefix):
-    identifiers = {str(item["number"]) for item in pull.get("closingIssuesReferences", [])}
+def closing_ids(pull, repository):
+    identifiers = set()
+    for item in pull.get("closingIssuesReferences", []):
+        match = re.fullmatch(r"https://github\.com/([^/]+/[^/]+)/issues/([1-9]\d*)/?",
+                             item.get("url", ""), re.I)
+        if (match and match[1].casefold() == repository.casefold()
+                and match[2] == str(item.get("number"))):
+            identifiers.add(match[2])
+    return identifiers
+
+
+def linked_ids(pull, prefix, repository):
+    identifiers = closing_ids(pull, repository)
     branch = pull.get("headRefName", "")
     if branch.startswith(prefix):
         value = branch[len(prefix):]
@@ -103,12 +114,12 @@ def snapshot(config, state, *, ignore_state_claim=None):
     integrated = set()
     for pull in pulls:
         if pull["state"] == "OPEN":
-            claimed.update(linked_ids(pull, config.prefix))
+            claimed.update(linked_ids(pull, config.prefix, config.repo))
         oid = (pull.get("mergeCommit") or {}).get("oid", "")
         if (pull["state"] == "MERGED" and pull["baseRefName"] == config.base
                 and re.fullmatch(r"[0-9a-f]{40,64}", oid)
                 and is_ancestor(config.root, oid, config.base_ref)):
-            integrated.update(str(item["number"]) for item in pull["closingIssuesReferences"])
+            integrated.update(closing_ids(pull, config.repo))
     tasks = [{"id": str(item["number"]), "title": item["title"], "body": item["body"] or "",
               "open": item["state"] == "OPEN", "labels": [label["name"] for label in item["labels"]],
               "created_at": item["createdAt"], "url": item["url"]} for item in issues]

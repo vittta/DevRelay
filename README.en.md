@@ -119,7 +119,7 @@ This uses existing configuration without overwriting configuration, ignore rules
 
 ### Selection and delivery
 
-Tasks must be open, carry `auto:approved`, exactly one `priority:P0/P1/P2`, no `blocked` / `needs-input`, and exactly one declaration: `Depends on: none` or `Depends on: #12, #27`. Dependencies must be closed and linked to merged PRs whose merge commits are ancestors of the refreshed target branch. Existing worktrees and explicitly associated open PRs prevent duplicate claims.
+Tasks must be open, carry `auto:approved`, exactly one `priority:P0/P1/P2`, no `blocked` / `needs-input`, and exactly one declaration: `Depends on: none` or `Depends on: #12, #27`. Dependencies must be closed and linked to merged PRs whose merge commits are ancestors of the refreshed target branch. Closing issue references must match the repository and number in their full GitHub URLs; same-number issues in other repositories neither satisfy dependencies nor claim local work through open PRs. Existing worktrees and explicitly associated open PRs prevent duplicate claims.
 
 ```bash
 devrelay next
