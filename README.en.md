@@ -84,7 +84,7 @@ Tasks with a local commit or an unmerged PR can run `prepare`, then `check/submi
 
 The external host owns agent sessions, plans, experiment budgets and exclusive editing between tool calls. DevRelay's worker lock covers tool execution, not editing between calls; do not start `watch` for that repository at the same time. Recover by inspecting `status` and the actual worktree, then continue editing or retry the tool. `resume` is specific to optional DevRelay Codex orchestration and cannot resume an external agent's session.
 
-`doctor` checks engineering tools and configured AI delivery dependencies by default; enabling `auto_review` or `auto_merge` still requires Codex. Run `doctor --with-codex` before optional orchestration or explicit `review`. See the [agent workflow](docs/agent-workflow.md) for the complete operating agreement.
+`doctor` reports missing target bases or invalid fetch mappings as failed checks and continues the remaining diagnostics. It checks engineering tools and configured AI delivery dependencies by default; enabling `auto_review` or `auto_merge` still requires Codex. Run `doctor --with-codex` before optional orchestration or explicit `review`. See the [agent workflow](docs/agent-workflow.md) for the complete operating agreement.
 
 ## GitHub queue
 
@@ -136,7 +136,7 @@ devrelay submit 12
 
 When a remote targets a different repository, the error identifies the fetch or push URL with `does not match project.repository`; correct that remote before retrying GitHub operations.
 
-Tracking updates after push and tracking cleanup use the first matching positive fetch refspec. Negative fetch refspecs restrict fetching, but do not cancel this tracking mapping.
+The target base, tracking updates after push and tracking cleanup use the first matching positive fetch refspec. The target branch must have a positive fetch mapping; a missing mapping stops the operation and requires configuration repair instead of falling back to stale refs such as `origin/main`. Negative fetch refspecs restrict fetching, but do not cancel this tracking mapping.
 
 Transport preserves Git's `GIT_CONFIG_NOSYSTEM` boolean policy: `0`/`false` keeps the original system settings, while `1`/`true` disables them. Other Git boolean spellings are supported; invalid values stop the transport.
 
@@ -246,6 +246,8 @@ Adding a local task explicitly approves it; a missing dependency declaration bec
 ## Evidence and recovery
 
 Verification binds source tree, HEAD, target base, configuration and task requirements. Temporary Git indexes hash tracked changes and non-ignored new files without modifying the original index. Checked-out submodules are inspected recursively for tracked changes and non-ignored untracked files. Isolated-index comparisons neutralize `assume-unchanged`, `skip-worktree`, `core.fileMode=false`, `submodule.*.ignore`, `.gitmodules` ignore settings and status configuration that could hide those changes. Any dirty submodule blocks acceptance, submission and automatic review/merge gates. DevRelay never commits, cleans, resets or updates submodule work.
+
+Acceptance in the main repository requires raw bytes of included regular files, symlink types and targets to match the Git tree that will be delivered. The isolated index still uses Git’s normal conversion rules. Filters that preserve the current bytes remain supported. Byte-changing clean/smudge filters, CRLF normalization or `working-tree-encoding` conversion stop acceptance explicitly, preserving the worktree and original index. Use a checkout whose bytes match the deliverable blobs before verification. DevRelay does not rewrite files or bypass legitimate transformations to commit different content.
 
 All Git operations that generate source evidence disable local replacement refs and inspect actual commit objects, leaving replacement refs untouched. NUL-delimited paths are parsed as bytes, supporting non-UTF-8 filenames and carriage returns where the filesystem permits them.
 

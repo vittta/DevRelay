@@ -93,10 +93,14 @@ def probe(argv, cwd):
 
 def doctor(config, *, with_codex=False):
     executable = config.data["codex"]["executable"]
-    checks = [{"id": "git", "ok": shutil.which("git") is not None},
-              {"id": "base", "ok": has_ref(config.root, config.base_ref), "value": config.base_ref},
-              {"id": "acceptance", "ok": bool(config.data["checks"]), "count": len(config.data["checks"])},
-              {"id": "git_identity", "ok": probe(["git", "var", "GIT_AUTHOR_IDENT"], config.root)}]
+    checks = [{"id": "git", "ok": shutil.which("git") is not None}]
+    try:
+        base_ref = config.base_ref
+        checks.append({"id": "base", "ok": has_ref(config.root, base_ref), "value": base_ref})
+    except RelayError as error:
+        checks.append({"id": "base", "ok": False, "error": str(error)})
+    checks += [{"id": "acceptance", "ok": bool(config.data["checks"]), "count": len(config.data["checks"])},
+               {"id": "git_identity", "ok": probe(["git", "var", "GIT_AUTHOR_IDENT"], config.root)}]
     codex_required = with_codex or config.data["delivery"]["auto_review"] or config.data["delivery"]["auto_merge"]
     if codex_required:
         checks += [{"id": "codex", "ok": shutil.which(executable) is not None},

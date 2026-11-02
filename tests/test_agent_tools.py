@@ -84,6 +84,28 @@ class AgentToolTests(RepositoryTest):
         self.assertFalse(report["ready"])
         self.assertTrue(report["codex_required"])
         self.assertFalse(next(item for item in report["checks"] if item["id"] == "codex")["ok"])
+        self.assertIn("no fetch tracking mapping",
+                      next(item for item in report["checks"] if item["id"] == "base")["error"])
+        self.assertIn("codex_login", {item["id"] for item in report["checks"]})
+
+    def test_doctor_reports_missing_base_mapping_and_keeps_other_diagnostics(self):
+        self.configure(provider="github")
+        self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
+        with (patch("devrelay.cli.validate_remote"),
+              patch("devrelay.cli.shutil.which", return_value="available"),
+              patch("devrelay.cli.probe", return_value=True)):
+            code, report = self.invoke("doctor", "--with-codex")
+        self.assertEqual(code, 1, report)
+        self.assertFalse(report["ready"])
+        self.assertTrue(report["codex_required"])
+        checks = {item["id"]: item for item in report["checks"]}
+        self.assertFalse(checks["base"]["ok"])
+        self.assertEqual(checks["base"]["error"],
+                         "Base main has no fetch tracking mapping for remote origin; "
+                         "configure a positive fetch refspec before using this project")
+        self.assertEqual(set(checks), {"git", "base", "acceptance", "git_identity", "codex",
+                                      "codex_login", "gh", "github_login", "remote_matches_repository"})
+        self.assertTrue(all(item["ok"] for key, item in checks.items() if key != "base"))
 
     def test_prepare_failure_retains_work_and_can_be_retried(self):
         self.configure(executable="/no-such-devrelay-codex", setup=[[
