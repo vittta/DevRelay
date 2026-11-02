@@ -51,7 +51,9 @@ class GitHubDeliveryFixture(RepositoryTest):
             return [{"number": 1, "url": "https://github.com/example/project/pull/1"}] if self.created else []
         task = self.state.get("12")
         return {"url": "https://github.com/example/project/pull/1", "state": "OPEN",
-                "headRefName": task["branch"], "headRefOid": self.readback_head or task["head_sha"], "baseRefName": "main"}
+                "headRefName": task["branch"],
+                "headRefOid": self.readback_head or self.git("--git-dir", str(self.remote), "rev-parse", task["branch"]), "baseRefName": "main",
+                "isCrossRepository": False, "autoMergeRequest": None}
 
     def pull_write(self, config, *argv, input=None):
         self.last_body = input
@@ -85,6 +87,147 @@ class GitHubDeliveryFixture(RepositoryTest):
 
 
 class GitHubDeliveryTests(GitHubDeliveryFixture):
+    def test_closed_saved_pr_blocks_new_commit_and_push_and_can_recover_same_pr(self):
+        self.implement()
+        with self.state.lock():
+            original = submit(self.config, self.state, "12")
+        path = Path(original["worktree"])
+        (path / "new.txt").write_text("new implementation\n")
+        with self.state.lock():
+            verify(self.config, self.state, "12")
+        index = self.git("diff", "--cached", cwd=path)
+
+        def closed(config, *argv):
+            self.assertEqual(argv[1:3], ("view", original["pr_url"]))
+            return {**self.pull_read(config, *argv), "state": "CLOSED"}
+
+        with self.state.lock(), patch("devrelay.runner.gh_json", side_effect=closed):
+            with self.assertRaisesRegex(RelayError, "closed/merged/pending"):
+                submit(self.config, self.state, "12")
+        saved = self.state.get("12")
+        self.assertEqual(saved["pr_url"], original["pr_url"])
+        self.assertEqual(saved["pr_observation"]["pull"]["state"], "CLOSED")
+        self.assertEqual(saved["status"], "blocked")
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=path), original["head_sha"])
+        self.assertEqual(self.git("diff", "--cached", cwd=path), index)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", original["branch"]), original["head_sha"])
+        self.assertEqual((path / "new.txt").read_text(), "new implementation\n")
+        with self.state.lock():
+            verify(self.config, self.state, "12")
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(recovered["pr_url"], original["pr_url"])
+        self.assertEqual(self.create_count, 1)
+        self.assertEqual(self.edit_count, 1)
+
+    def test_saved_pr_identity_and_pending_merge_are_checked_before_publication(self):
+        self.implement()
+        with self.state.lock():
+            original = submit(self.config, self.state, "12")
+        path = Path(original["worktree"])
+        (path / "new.txt").write_text("pending implementation\n")
+        changes = [{"state": "MERGED"}, {"headRefName": "other"}, {"headRefOid": "0" * 40},
+                   {"baseRefName": "other"}, {"isCrossRepository": True},
+                   {"url": "https://github.com/other/repo/pull/1"}, {"autoMergeRequest": {"enabledAt": "now"}}]
+        for change in changes:
+            with self.subTest(change=change), self.state.lock():
+                verify(self.config, self.state, "12")
+                with patch("devrelay.runner.gh_json", side_effect=lambda c, *a: {**self.pull_read(c, *a), **change}):
+                    with self.assertRaisesRegex(RelayError, "PR readback differs"):
+                        submit(self.config, self.state, "12")
+                self.assertEqual(self.state.get("12")["pr_url"], original["pr_url"])
+                self.assertEqual(self.git("rev-parse", "HEAD", cwd=path), original["head_sha"])
+                self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", original["branch"]), original["head_sha"])
+        self.assertEqual(self.create_count, 1)
+        self.assertEqual(self.edit_count, 0)
+
+    def test_saved_pr_from_another_repository_blocks_api_and_publication(self):
+        self.implement()
+        with self.state.lock():
+            task = submit(self.config, self.state, "12")
+            verify(self.config, self.state, "12")
+            task = self.state.get("12")
+            task["pr_url"] = "https://github.com/other/repo/pull/1"
+            self.state.save(task)
+            with patch("devrelay.runner.gh_json", side_effect=AssertionError("Foreign PR must not be queried")):
+                with self.assertRaisesRegex(RelayError, "configured repository"):
+                    submit(self.config, self.state, "12")
+        self.assertEqual(self.create_count, 1)
+
+    def test_pr_closed_during_commit_blocks_push_and_preserves_local_commit(self):
+        self.implement()
+        with self.state.lock():
+            original = submit(self.config, self.state, "12")
+        (Path(original["worktree"]) / "new.txt").write_text("new implementation\n")
+        closed = False
+
+        def commit_then_close(root, *argv, **kwargs):
+            nonlocal closed
+            result = real_git(root, *argv, **kwargs)
+            if argv[0] == "commit":
+                closed = True
+            return result
+
+        def read(config, *argv):
+            pull = self.pull_read(config, *argv)
+            return {**pull, "state": "CLOSED"} if closed else pull
+
+        with self.state.lock():
+            verify(self.config, self.state, "12")
+            with patch("devrelay.runner.git", side_effect=commit_then_close), patch("devrelay.runner.gh_json", side_effect=read):
+                with self.assertRaisesRegex(RelayError, "PR readback differs"):
+                    submit(self.config, self.state, "12")
+        saved = self.state.get("12")
+        self.assertNotEqual(saved["head_sha"], original["head_sha"])
+        self.assertEqual(saved["published_head"], original["head_sha"])
+        self.assertEqual(saved["pr_url"], original["pr_url"])
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", saved["branch"]), original["head_sha"])
+
+    def test_uncertain_push_recovers_using_saved_publication_heads(self):
+        self.implement()
+        with self.state.lock():
+            original = submit(self.config, self.state, "12")
+        (Path(original["worktree"]) / "new.txt").write_text("new implementation\n")
+
+        def push_then_timeout(root, *argv, **kwargs):
+            result = real_git(root, *argv, **kwargs)
+            if argv[0] == "push":
+                raise RelayError("Push timed out after remote accepted it")
+            return result
+
+        with self.state.lock():
+            verify(self.config, self.state, "12")
+            with patch("devrelay.runner.git", side_effect=push_then_timeout):
+                with self.assertRaisesRegex(RelayError, "Push timed out"):
+                    submit(self.config, self.state, "12")
+            interrupted = self.state.get("12")
+            self.assertEqual(interrupted["published_head"], original["head_sha"])
+            self.assertEqual(interrupted["push_intent"]["head_sha"], interrupted["head_sha"])
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(recovered["pr_url"], original["pr_url"])
+        self.assertEqual(recovered["head_sha"], interrupted["head_sha"])
+        self.assertEqual(recovered["published_head"], recovered["head_sha"])
+        self.assertNotIn("push_intent", recovered)
+        self.assertEqual(self.create_count, 1)
+
+    def test_closed_pr_after_uncertain_creation_is_discovered_without_replacement(self):
+        self.implement()
+        self.timeout_after_create = True
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "timed out"):
+            submit(self.config, self.state, "12")
+
+        def read(config, *argv):
+            result = self.pull_read(config, *argv)
+            if argv[1] == "list":
+                self.assertEqual(argv[argv.index("--state") + 1], "all")
+                return result
+            return {**result, "state": "CLOSED"}
+
+        with self.state.lock(), patch("devrelay.runner.gh_json", side_effect=read):
+            with self.assertRaisesRegex(RelayError, "PR readback differs"):
+                submit(self.config, self.state, "12")
+        self.assertEqual(self.state.get("12")["pr_url"], "https://github.com/example/project/pull/1")
+        self.assertEqual(self.create_count, 1)
+
     def test_requirements_changed_during_commit_block_push_and_can_be_revalidated(self):
         task = self.implement()
         worktree = Path(task["worktree"])

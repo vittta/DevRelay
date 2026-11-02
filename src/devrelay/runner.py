@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import uuid
 
 from . import codex
@@ -282,6 +283,50 @@ def run_task(config, state, identifier=None, *, resume=False, submit_after=False
         raise
 
 
+def submission_pull(config, state, task, *, heads=None):
+    if not task.get("pr_url"):
+        pulls = gh_json(config, "pr", "list", "--head", task["branch"],
+                        "--state", "all", "--limit", "100", "--json", "number,url")
+        if len(pulls) > 1:
+            raise RelayError("Multiple PRs own this task branch; inspect delivery before retrying")
+        if not pulls:
+            return None
+        task["pr_url"] = pulls[0]["url"]
+        state.save(task)
+    try:
+        url = task["pr_url"]
+        match = re.fullmatch(r"https://github\.com/([^/]+/[^/]+)/pull/([1-9]\d*)", url)
+        if not match or match[1].casefold() != config.repo.casefold():
+            raise RelayError("Saved PR URL differs from the configured repository; preserve delivery and inspect GitHub")
+        pull = gh_json(config, "pr", "view", url, "--json",
+                       "url,state,headRefName,headRefOid,baseRefName,isCrossRepository,autoMergeRequest")
+        task["pr_observation"] = {"checked_at": now(), "pull": pull}
+        state.save(task)
+        if not isinstance(pull, dict) or any(not isinstance(pull.get(key), str) for key in
+                ("url", "state", "headRefName", "headRefOid", "baseRefName")):
+            raise RelayError("GitHub returned incomplete PR identity; preserve delivery and inspect GitHub")
+        allowed = heads if heads is not None else {task.get("published_head", task.get("head_sha"))}
+        intent = task.get("push_intent")
+        if heads is None and intent and intent["previous_sha"] in allowed:
+            allowed.add(intent["head_sha"])
+        if (pull.get("url", "").casefold() != url.casefold() or pull.get("state") != "OPEN"
+                or pull.get("headRefName") != task["branch"] or pull.get("headRefOid") not in allowed - {None}
+                or pull.get("baseRefName") != config.base or pull.get("isCrossRepository") is not False
+                or "autoMergeRequest" not in pull or pull["autoMergeRequest"] is not None
+                or task.get("merge_request")):
+            raise RelayError("PR readback differs from the saved submission or is closed/merged/pending; preserve delivery and inspect GitHub")
+    except RelayError as error:
+        task.update(status="blocked", error=str(error))
+        state.save(task)
+        raise
+    task["published_head"] = pull["headRefOid"]
+    if intent := task.get("push_intent"):
+        if pull["headRefOid"] == intent["head_sha"]:
+            task.pop("push_intent")
+    state.save(task)
+    return pull
+
+
 def submit(config, state, identifier, *, local=False):
     if config.provider != "github" and not local:
         raise RelayError("Local tasks use submit --local to create a verified local commit")
@@ -290,6 +335,9 @@ def submit(config, state, identifier, *, local=False):
         from .delivery import advance
         return advance(config, state, identifier)
     task = claimed_task(config, state, identifier)
+    if not local:
+        validate_remote(config)
+        submission_pull(config, state, task)
     if task.get("pr_url") and task["status"] not in ("verified", "committed") and not local:
         from .delivery import advance
         if not (config.data["delivery"]["auto_review"] or config.data["delivery"]["auto_merge"]):
@@ -319,11 +367,14 @@ def submit(config, state, identifier, *, local=False):
     if local:
         return task
     submission_evidence(config, state, task, record, head=head)
+    submission_pull(config, state, task)
     push_url = validate_remote(config, path)
     ref = "refs/heads/" + task["branch"]
     # Pin the exact validated endpoint in the transport invocation. A remote
     # name could fan out, while a later rewrite could redirect a plain URL.
     tracking_ref = remote_tracking_ref(path, config.remote, task["branch"])
+    task["push_intent"] = {"head_sha": head, "previous_sha": task.get("published_head"), "started_at": now()}
+    state.save(task)
     with pinned_transport(path, push_url) as (target, env):
         git(path, "push", target, ref + ":" + ref, env=env)
     if tracking_ref is not None:
@@ -338,19 +389,16 @@ def submit(config, state, identifier, *, local=False):
     body = (f"{summary}\n\nVerification\n\n{check_lines}\n\n"
             f"Source tree: `{record['source_tree']}`\nBase: `{record['base_sha']}`\n"
             f"Configuration SHA-256: `{record['config_sha256']}`\n\nRefs #{identifier}\n")
-    existing = gh_json(config, "pr", "list", "--head", task["branch"], "--base", config.base,
-                       "--state", "open", "--json", "number,url")
+    submission_pull(config, state, task, heads={head})
     submission_evidence(config, state, task, record, head=head)
-    if existing:
-        url = existing[0]["url"]
-        gh(config, "pr", "edit", str(existing[0]["number"]), "--body-file", "-", input=body)
+    if task.get("pr_url"):
+        gh(config, "pr", "edit", task["pr_url"], "--body-file", "-", input=body)
     else:
         url = gh(config, "pr", "create", "--draft", "--base", config.base, "--head", task["branch"],
                  "--title", fresh["title"], "--body-file", "-", input=body)
-    pull = gh_json(config, "pr", "view", url, "--json", "url,state,headRefName,headRefOid,baseRefName")
-    if (pull["state"] != "OPEN" or pull["headRefName"] != task["branch"]
-            or pull["headRefOid"] != head or pull["baseRefName"] != config.base):
-        raise RelayError("PR readback differs from the verified submission; inspect it before retrying")
+        task["pr_url"] = url
+        state.save(task)
+    pull = submission_pull(config, state, task, heads={head})
     task.update(status="pr_open", pr_url=pull["url"])
     state.save(task)
     submission_evidence(config, state, task, record, head=head)
