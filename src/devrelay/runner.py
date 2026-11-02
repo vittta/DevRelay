@@ -335,14 +335,16 @@ def submit(config, state, identifier, *, local=False):
         from .delivery import advance
         return advance(config, state, identifier)
     task = claimed_task(config, state, identifier)
-    if not local:
-        validate_remote(config)
-        submission_pull(config, state, task)
     if task.get("pr_url") and task["status"] not in ("verified", "committed") and not local:
         from .delivery import advance
         if not (config.data["delivery"]["auto_review"] or config.data["delivery"]["auto_merge"]):
+            validate_remote(config)
+            submission_pull(config, state, task)
             submission_evidence(config, state, task, task.get("verification"), head=task.get("head_sha"))
         return advance(config, state, identifier)
+    if not local:
+        validate_remote(config)
+        submission_pull(config, state, task)
     record = task.get("verification")
     path = Path(task["worktree"])
     fresh = submission_evidence(config, state, task, record)

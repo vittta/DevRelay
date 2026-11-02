@@ -388,6 +388,23 @@ class MergeTests(GitHubDeliveryFixture):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.merge_count, 1)
 
+    def test_submit_recovers_queued_merge_without_repeating_publication_or_merge_request(self):
+        self.enable(required_checks=["test"])
+        self.request_pending = True
+        waiting = self.deliver()
+        self.assertEqual(waiting["status"], "merge_waiting")
+        with self.state.lock():
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(recovered["status"], "merge_waiting")
+        self.assertEqual(recovered["merge_request"], waiting["merge_request"])
+        self.assertEqual(recovered["review"], waiting["review"])
+        self.assertEqual((self.create_count, self.edit_count, self.merge_count), (1, 0, 1))
+        self.server_merge()
+        with self.state.lock():
+            completed = submit(self.config, self.state, "12")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual((self.create_count, self.edit_count, self.merge_count), (1, 0, 1))
+
     def test_post_merge_check_failure_preserves_merged_state_and_retry_does_not_merge_again(self):
         self.enable(cleanup_branches=True, cleanup_worktrees=True)
         def fail_post(state, argv, cwd, log, timeout, **kwargs):
