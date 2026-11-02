@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from devrelay.errors import RelayError
-from devrelay.providers import Snapshot, dependencies, gh, linked_ids, queue_report, snapshot, task_id
+from devrelay.providers import Snapshot, closing_ids, dependencies, gh, linked_ids, queue_report, snapshot, task_id
 
 from helpers import RepositoryTest
 
@@ -85,6 +85,48 @@ class QueueTests(RepositoryTest):
                 self.assertIsNone(report["selected"])
                 self.assertIn(reason, str(report["excluded"]))
 
+    def test_shared_dependency_graph_parses_each_task_once(self):
+        tasks = [issue(number, opened=number == 60,
+                       body="Depends on: none" if number < 3 else f"Depends on: #{number - 1}, #{number - 2}")
+                 for number in range(1, 61)]
+        with patch("devrelay.providers.dependencies", wraps=dependencies) as parsed:
+            report = self.report(tasks, integrated={str(number) for number in range(1, 60)})
+        self.assertEqual(report["selected"]["id"], "60")
+        self.assertEqual(parsed.call_count, 60)
+
+    def test_shared_dependency_failures_remain_explicit_and_deduplicated(self):
+        tasks = [issue(number, opened=number == 40,
+                       body="Depends on: #999" if number < 3 else f"Depends on: #{number - 1}, #{number - 2}")
+                 for number in range(1, 41)]
+        report = self.report(tasks, integrated={str(number) for number in range(1, 40)})
+        self.assertIsNone(report["selected"])
+        self.assertEqual(report["excluded"], [{"id": "40", "reasons": ["Unknown dependency #999"]}])
+
+    def test_cached_dependencies_keep_path_depth_and_cycles(self):
+        chain = [issue(number, opened=number == 66,
+                       body="Depends on: none" if number == 1 else f"Depends on: #{number - 1}")
+                 for number in range(1, 67)]
+        report = self.report([issue(67, body="Depends on: #1"), *chain],
+                             integrated={str(number) for number in range(1, 66)})
+        self.assertEqual([task["id"] for task in report["eligible"]], ["67"])
+        self.assertIn("Dependency chain exceeds the supported depth (64)", str(report["excluded"]))
+        tasks = [issue(1, opened=False, body="Depends on: #2"),
+                 issue(2, opened=False, body="Depends on: #1"),
+                 issue(3, body="Depends on: #1"), issue(4, body="Depends on: #2")]
+        report = self.report(tasks, integrated={"1", "2"})
+        self.assertIsNone(report["selected"])
+        self.assertEqual({task["id"] for task in report["excluded"]}, {"3", "4"})
+        for excluded in report["excluded"]:
+            self.assertTrue(any(reason.startswith("Dependency cycle:") for reason in excluded["reasons"]))
+
+    def test_dependency_cache_does_not_outlive_its_snapshot_report(self):
+        tasks = [issue(1, opened=False), issue(2, body="Depends on: #1")]
+        self.assertEqual(self.report(tasks, integrated={"1"})["selected"]["id"], "2")
+        tasks[0]["body"] = "Depends on: #999"
+        report = self.report(tasks, integrated={"1"})
+        self.assertIsNone(report["selected"])
+        self.assertIn("Unknown dependency #999", str(report["excluded"]))
+
     def test_claimed_task_can_be_authorized_for_recovery(self):
         view = Snapshot([issue(1)], {"1"}, set())
         self.assertIsNone(queue_report(self.config, view)["selected"])
@@ -92,7 +134,60 @@ class QueueTests(RepositoryTest):
 
     def test_pr_refs_do_not_confuse_dependency_mentions(self):
         pull = {"headRefName": "fix/other", "body": "Refs #12, #27\nDepends on: #99"}
-        self.assertEqual(linked_ids(pull, self.config.prefix), {"12", "27"})
+        self.assertEqual(linked_ids(pull, self.config.prefix, self.config.repo), {"12", "27"})
+
+    def test_closing_references_bind_the_repository_and_issue_number(self):
+        references = [
+            {"number": 12, "url": "https://github.com/other/repo/issues/12"},
+            {"number": 13, "url": "https://github.com/EXAMPLE/Project/issues/13"},
+            {"number": 14},
+            {"number": 15, "url": "https://github.com/example/project/issues/16"},
+            {"number": 17, "url": "https://github.example/example/project/issues/17"},
+            {"number": 18, "url": "https://github.com/example/project/pull/18"},
+        ]
+        self.assertEqual(closing_ids({"closingIssuesReferences": references}, self.config.repo), {"13"})
+
+    def test_open_pr_cross_repository_closing_reference_does_not_claim_local_issue(self):
+        pull = {"headRefName": "fix/unrelated", "body": "Fixes other/repo#12\nRefs #13",
+                "closingIssuesReferences": [
+                    {"number": 12, "url": "https://github.com/other/repo/issues/12"},
+                    {"number": 14, "url": "https://github.com/example/project/issues/14"},
+                ]}
+        self.assertEqual(linked_ids(pull, self.config.prefix, self.config.repo), {"13", "14"})
+        pull["headRefName"] = self.config.prefix + "15"
+        self.assertEqual(linked_ids(pull, self.config.prefix, self.config.repo), {"13", "14", "15"})
+
+    def test_cross_repository_merge_does_not_unlock_a_local_dependency(self):
+        self.config = self.configure(provider="github")
+        self.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+        base = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/main", base)
+        issues = [{"number": identifier, "title": "Task", "body": body, "state": state,
+                   "labels": [{"name": "auto:approved"}, {"name": "priority:P1"}],
+                   "url": f"https://github.com/example/project/issues/{identifier}",
+                   "createdAt": "2026-10-09T00:00:00Z"}
+                  for identifier, body, state in ((12, "Depends on: none", "CLOSED"),
+                                                   (13, "Depends on: #12", "OPEN"))]
+        pull = {"state": "MERGED", "baseRefName": "main", "mergeCommit": {"oid": base},
+                "closingIssuesReferences": [{"number": 12, "url": "https://github.com/other/repo/issues/12"}]}
+        from devrelay import providers
+        real_git = providers.git
+        def offline_git(root, *argv):
+            return "" if argv[0] == "fetch" else real_git(root, *argv)
+        for repository, expected in (("other/repo", set()), ("example/project", {"12"})):
+            with self.subTest(repository=repository):
+                pull["closingIssuesReferences"][0]["url"] = f"https://github.com/{repository}/issues/12"
+                with (patch.object(providers, "git", side_effect=offline_git),
+                      patch.object(providers, "validate_remote"),
+                      patch.object(providers, "gh_json", side_effect=[issues, [pull]])):
+                    view = snapshot(self.config, self.state)
+                self.assertEqual(view.integrated, expected)
+                report = queue_report(self.config, view)
+                if expected:
+                    self.assertEqual(report["selected"]["id"], "13")
+                else:
+                    self.assertIsNone(report["selected"])
+                    self.assertIn("Dependency #12 is not closed and integrated", str(report["excluded"]))
 
     def test_github_command_pins_the_host_instead_of_inheriting_gh_host(self):
         with patch("devrelay.providers.command", return_value="[]") as called:
@@ -121,13 +216,15 @@ class QueueTests(RepositoryTest):
 
     def test_github_integration_uses_actual_base_ancestry(self):
         self.config = self.configure(provider="github")
+        self.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
         base = self.git("rev-parse", "HEAD")
         self.git("update-ref", "refs/remotes/origin/main", base)
         (self.root / "value.txt").write_text("unmerged\n")
         self.git("commit", "-qam", "unmerged")
         unmerged = self.git("rev-parse", "HEAD")
         pulls = [{"state": "MERGED", "baseRefName": "main", "mergeCommit": {"oid": oid},
-                  "closingIssuesReferences": [{"number": number}]} for number, oid in ((1, base), (2, unmerged))]
+                  "closingIssuesReferences": [{"number": number,
+                                                "url": f"https://github.com/example/project/issues/{number}"}]} for number, oid in ((1, base), (2, unmerged))]
         from devrelay import providers
         real_git = providers.git
         def offline_git(root, *argv):
