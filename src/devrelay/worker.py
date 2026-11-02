@@ -1,10 +1,10 @@
 """Continuous serial dispatch with configurable manual or verified automatic merge."""
 
-import signal
 from time import sleep
 
 from .delivery import advance, abort_pending, merge
 from .errors import RelayError
+from .process import interrupt_on_sigterm
 from .providers import queue_report, snapshot
 from .runner import assert_config, run_task, submit
 from .state import now
@@ -66,12 +66,8 @@ def watch(config, state, *, poll_interval=60, max_tasks=None, emit):
     def event(name, **fields):
         emit({"event": name, "at": now(), **fields})
 
-    def interrupt(signum, frame):
-        raise KeyboardInterrupt
-
     delivered = 0
-    previous_handler = signal.signal(signal.SIGTERM, interrupt)
-    try:
+    with interrupt_on_sigterm():
         with state.lock():
             automatic = config.data["delivery"]["auto_merge"]
             event("watch_started", poll_interval=poll_interval, max_tasks=max_tasks,
@@ -124,8 +120,6 @@ def watch(config, state, *, poll_interval=60, max_tasks=None, emit):
                     if task.get("merge_request") and not task.get("merge_sha") and task["status"] != "completed":
                         abort_pending(config, state, task, str(error))
                 raise
-    except KeyboardInterrupt:
-        event("watch_stopped", reason="interrupted", delivered=delivered)
-        raise
-    finally:
-        signal.signal(signal.SIGTERM, previous_handler)
+            except KeyboardInterrupt:
+                event("watch_stopped", reason="interrupted", delivered=delivered)
+                raise

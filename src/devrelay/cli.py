@@ -13,6 +13,7 @@ from .delivery import merge, review
 from .errors import RelayError
 from .git import has_ref, repository_root, validate_remote, worktrees
 from .onboarding import setup_github
+from .process import interrupt_on_sigterm
 from .providers import add_local, queue_report, snapshot
 from .runner import complete_local, prepare_task, run_task, start, submit, verify
 from .state import State
@@ -129,6 +130,11 @@ def controller(root, state):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    with interrupt_on_sigterm():
+        return _dispatch(args)
+
+
+def _dispatch(args):
     state = None
     try:
         if args.workspace:

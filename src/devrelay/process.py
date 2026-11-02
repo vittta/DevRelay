@@ -1,5 +1,6 @@
 """Bounded foreground commands with retained logs and crash markers."""
 
+from contextlib import contextmanager
 import json
 import locale
 import os
@@ -15,6 +16,18 @@ from .state import group_alive, now
 _TERMINATE_GRACE_SECONDS = 3
 _KILL_GRACE_SECONDS = 3
 _GROUP_POLL_SECONDS = 0.05
+
+
+@contextmanager
+def interrupt_on_sigterm():
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, interrupt)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def _read_output(reader, pending, on_output_line, *, final=False):
