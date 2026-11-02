@@ -1,9 +1,10 @@
 from pathlib import Path
 import subprocess
+import os
 from unittest.mock import patch
 
 from helpers import RepositoryTest
-from devrelay.git import _evidence_git, _submodule_content_matches_head
+from devrelay.git import _evidence_git, _submodule_content_matches_head, git, is_ancestor
 
 
 class RawBlobEvidenceTests(RepositoryTest):
@@ -56,3 +57,35 @@ class RawBlobEvidenceTests(RepositoryTest):
         (self.root / "value.txt").write_text("different\n")
         self.assertEqual(self.git("hash-object", "--path=value.txt", "value.txt"), self.git("rev-parse", "HEAD:value.txt"))
         self.assertFalse(_submodule_content_matches_head(self.root))
+
+
+class ActualHistoryTests(RepositoryTest):
+    def test_replacement_cannot_forge_ancestry_and_is_preserved(self):
+        original = self.git("rev-parse", "HEAD")
+        (self.root / "required-base.txt").write_text("required\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "new base")
+        base = self.git("rev-parse", "HEAD")
+        tree = self.git("rev-parse", original + "^{tree}")
+        replacement = subprocess.check_output(
+            ["git", "commit-tree", tree, "-p", base], cwd=self.root,
+            input="replacement\n", text=True).strip()
+        self.git("replace", original, replacement)
+        self.assertEqual(subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base, original],
+            cwd=self.root, env={key: value for key, value in os.environ.items() if key != "GIT_NO_REPLACE_OBJECTS"}).returncode, 0)
+        self.assertFalse(is_ancestor(self.root, base, original))
+        self.assertEqual(git(self.root, "rev-list", "--parents", "-n", "1", original), original)
+        self.assertEqual(self.git("rev-parse", "refs/replace/" + original), replacement)
+
+    def test_commit_tree_queries_ignore_replacement_trees(self):
+        original = self.git("rev-parse", "HEAD")
+        original_tree = self.git("rev-parse", "HEAD^{tree}")
+        (self.root / "value.txt").write_text("replacement\n")
+        self.git("commit", "-qam", "replacement")
+        replacement = self.git("rev-parse", "HEAD")
+        self.git("replace", original, replacement)
+        self.assertNotEqual(self.git("rev-parse", original + "^{tree}"), original_tree)
+        self.assertEqual(git(self.root, "rev-parse", original + "^{tree}"), original_tree)
+        self.assertEqual(git(self.root, "show", original + ":value.txt"), "broken")
+        self.assertEqual(self.git("rev-parse", "refs/replace/" + original), replacement)

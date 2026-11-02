@@ -24,8 +24,9 @@ def command(argv, cwd, *, input=None, env=None, timeout=60, text=True):
     return result.stdout.strip() if text else result.stdout
 
 
-def git(root, *argv, **kwargs):
-    return command(["git", *argv], root, **kwargs)
+def git(root, *argv, env=None, **kwargs):
+    env = {**os.environ, **(env or {}), "GIT_NO_REPLACE_OBJECTS": "1"}
+    return command(["git", *argv], root, env=env, **kwargs)
 
 
 def _evidence_git(root, *argv, env=None, **kwargs):
@@ -44,12 +45,14 @@ def common_dir(root):
 
 def has_ref(root, ref):
     return subprocess.run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
-                          cwd=root, capture_output=True).returncode == 0
+                          cwd=root, capture_output=True,
+                          env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}).returncode == 0
 
 
 def is_ancestor(root, commit, ref):
     return subprocess.run(["git", "merge-base", "--is-ancestor", commit, ref],
-                          cwd=root, capture_output=True).returncode == 0
+                          cwd=root, capture_output=True,
+                          env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}).returncode == 0
 
 
 def _gitlink_paths(root, *, env=None):
