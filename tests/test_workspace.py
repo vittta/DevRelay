@@ -319,12 +319,19 @@ class WorkspaceTest(RepositoryTest):
         self.fixed()
         with patch.dict(os.environ, DEVRELAY_TEST_REVIEW="changes_requested"):
             code, reviewed = self.invoke("review", "fix")
-            self.assertEqual(code, 0, reviewed)
+            self.assertEqual(code, 1, reviewed)
+            self.assertEqual(reviewed["status"], "review_blocked")
             self.assertEqual(reviewed['review']['verdict'], 'changes_requested')
-        self.assertEqual(self.invoke("check", "fix")[0], 0)
+        code, checked = self.invoke("check", "fix")
+        self.assertEqual(code, 0, checked)
+        self.assertTrue(checked["review_required"])
+        self.assertIsNone(checked["review"])
         code, report = self.invoke("submit", "fix", "--local")
         self.assertEqual(code, 1)
         self.assertIn("review", report["error"])
+        for key, member in checked["members"].items():
+            self.assertEqual(self.git("rev-parse", "HEAD", cwd=member["worktree"]),
+                             checked["verification"]["members"][key]["head_sha"])
         self.assertEqual(self.invoke("review", "fix")[0], 0)
         self.assertEqual(self.invoke("submit", "fix", "--local")[0], 0)
 
