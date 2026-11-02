@@ -85,6 +85,48 @@ class QueueTests(RepositoryTest):
                 self.assertIsNone(report["selected"])
                 self.assertIn(reason, str(report["excluded"]))
 
+    def test_shared_dependency_graph_parses_each_task_once(self):
+        tasks = [issue(number, opened=number == 60,
+                       body="Depends on: none" if number < 3 else f"Depends on: #{number - 1}, #{number - 2}")
+                 for number in range(1, 61)]
+        with patch("devrelay.providers.dependencies", wraps=dependencies) as parsed:
+            report = self.report(tasks, integrated={str(number) for number in range(1, 60)})
+        self.assertEqual(report["selected"]["id"], "60")
+        self.assertEqual(parsed.call_count, 60)
+
+    def test_shared_dependency_failures_remain_explicit_and_deduplicated(self):
+        tasks = [issue(number, opened=number == 40,
+                       body="Depends on: #999" if number < 3 else f"Depends on: #{number - 1}, #{number - 2}")
+                 for number in range(1, 41)]
+        report = self.report(tasks, integrated={str(number) for number in range(1, 40)})
+        self.assertIsNone(report["selected"])
+        self.assertEqual(report["excluded"], [{"id": "40", "reasons": ["Unknown dependency #999"]}])
+
+    def test_cached_dependencies_keep_path_depth_and_cycles(self):
+        chain = [issue(number, opened=number == 66,
+                       body="Depends on: none" if number == 1 else f"Depends on: #{number - 1}")
+                 for number in range(1, 67)]
+        report = self.report([issue(67, body="Depends on: #1"), *chain],
+                             integrated={str(number) for number in range(1, 66)})
+        self.assertEqual([task["id"] for task in report["eligible"]], ["67"])
+        self.assertIn("Dependency chain exceeds the supported depth (64)", str(report["excluded"]))
+        tasks = [issue(1, opened=False, body="Depends on: #2"),
+                 issue(2, opened=False, body="Depends on: #1"),
+                 issue(3, body="Depends on: #1"), issue(4, body="Depends on: #2")]
+        report = self.report(tasks, integrated={"1", "2"})
+        self.assertIsNone(report["selected"])
+        self.assertEqual({task["id"] for task in report["excluded"]}, {"3", "4"})
+        for excluded in report["excluded"]:
+            self.assertTrue(any(reason.startswith("Dependency cycle:") for reason in excluded["reasons"]))
+
+    def test_dependency_cache_does_not_outlive_its_snapshot_report(self):
+        tasks = [issue(1, opened=False), issue(2, body="Depends on: #1")]
+        self.assertEqual(self.report(tasks, integrated={"1"})["selected"]["id"], "2")
+        tasks[0]["body"] = "Depends on: #999"
+        report = self.report(tasks, integrated={"1"})
+        self.assertIsNone(report["selected"])
+        self.assertIn("Unknown dependency #999", str(report["excluded"]))
+
     def test_claimed_task_can_be_authorized_for_recovery(self):
         view = Snapshot([issue(1)], {"1"}, set())
         self.assertIsNone(queue_report(self.config, view)["selected"])
@@ -117,6 +159,7 @@ class QueueTests(RepositoryTest):
 
     def test_cross_repository_merge_does_not_unlock_a_local_dependency(self):
         self.config = self.configure(provider="github")
+        self.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
         base = self.git("rev-parse", "HEAD")
         self.git("update-ref", "refs/remotes/origin/main", base)
         issues = [{"number": identifier, "title": "Task", "body": body, "state": state,
@@ -173,6 +216,7 @@ class QueueTests(RepositoryTest):
 
     def test_github_integration_uses_actual_base_ancestry(self):
         self.config = self.configure(provider="github")
+        self.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
         base = self.git("rev-parse", "HEAD")
         self.git("update-ref", "refs/remotes/origin/main", base)
         (self.root / "value.txt").write_text("unmerged\n")

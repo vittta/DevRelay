@@ -129,27 +129,39 @@ def snapshot(config, state, *, ignore_state_claim=None):
 def queue_report(config, view, *, exclude_claimed=True):
     queue = config.data["queue"]
     by_id = {item["id"]: item for item in view.tasks}
+    declarations, validation = {}, {}
+
+    def declaration(identifier):
+        if identifier not in declarations:
+            item = by_id.get(identifier)
+            if item is None:
+                declarations[identifier] = ([], [f"Unknown dependency #{identifier}"])
+            else:
+                try:
+                    declarations[identifier] = (dependencies(item["body"], github=config.provider == "github"), [])
+                except RelayError as error:
+                    historical = not item.get("open", True) and not re.search(r"^Depends on:", item["body"], re.M)
+                    declarations[identifier] = ([], [] if historical else [str(error)])
+        return declarations[identifier]
+
     def dependency_errors(identifier, trail=()):
         if len(trail) > 64:
             return ["Dependency chain exceeds the supported depth (64)"]
         if identifier in trail:
-            return ["Dependency cycle: " + " -> ".join((*trail, identifier))]
-        item = by_id.get(identifier)
-        if item is None:
-            return [f"Unknown dependency #{identifier}"]
-        try:
-            required = dependencies(item["body"], github=config.provider == "github")
-        except RelayError as error:
-            if not item.get("open", True) and not re.search(r"^Depends on:", item["body"], re.M):
-                return []  # Closed historical issues may predate the template.
-            return [str(error)]
-        errors = []
-        for dependency in required:
-            errors.extend(dependency_errors(dependency, (*trail, identifier)))
-            target = by_id.get(dependency)
-            if target and (target.get("open", True) or dependency not in view.integrated):
-                errors.append(f"Dependency #{dependency} is not closed and integrated into the base")
-        return errors
+            cycle = (*trail[trail.index(identifier):], identifier)
+            return ["Dependency cycle: " + " -> ".join(cycle)]
+        key = (identifier, len(trail))
+        if key not in validation:
+            required, errors = declaration(identifier)
+            errors = list(errors)
+            for dependency in required:
+                errors.extend(dependency_errors(dependency, (*trail, identifier)))
+                target = by_id.get(dependency)
+                if target and (target.get("open", True) or dependency not in view.integrated):
+                    errors.append(f"Dependency #{dependency} is not closed and integrated into the base")
+            validation[key] = tuple(dict.fromkeys(errors))
+        return validation[key]
+
     eligible, excluded = [], []
     for task in view.tasks:
         if not task.get("open", True):
