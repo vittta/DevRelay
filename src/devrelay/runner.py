@@ -169,6 +169,7 @@ def verify(config, state, identifier):
     directory.mkdir(parents=True)
     task["status"] = "verifying"
     task["verification"] = None
+    task["verification_path"] = str(directory / "verification.json")
     state.save(task)
     results = []
     try:
@@ -187,10 +188,11 @@ def verify(config, state, identifier):
             raise RelayError("Task requirements changed during verification; resume and revalidate")
         if source_tree(path) != before or git(path, "rev-parse", "HEAD") != head:
             raise RelayError("Source or HEAD changed while finalizing verification; rerun the checks")
-    except RelayError as error:
-        task.update(status="failed", error=str(error))
+    except (RelayError, OSError, KeyboardInterrupt) as error:
+        message = str(error) or "Interrupted"
+        task.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed", error=message)
         state.save(task)
-        (directory / "verification.json").write_text(json.dumps({"passed": False, "error": str(error), "checks": results}, indent=2))
+        (directory / "verification.json").write_text(json.dumps({"passed": False, "error": message, "checks": results}, indent=2))
         raise
     record = {"passed": True, "source_tree": before, "head_sha": head, "base_sha": base,
               "config_sha256": config.fingerprint, "task_body": fresh["body"], "task_title": fresh["title"],
