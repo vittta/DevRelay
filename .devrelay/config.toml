@@ -4,7 +4,7 @@ provider = "github"
 base_branch = "main"
 remote = "origin"
 branch_prefix = "devrelay/task-"
-repository = "kleinlau17/DevRelay"
+repository = "vittta/DevRelay"
 
 [queue]
 approval_label = "auto:approved"
