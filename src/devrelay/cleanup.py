@@ -47,7 +47,8 @@ def run(config, state, task):
     """Keep acceptance and cleanup results separate; retry by inspecting actual Git state."""
     proof = task.get("post_merge") or {}
     if (not proof.get("passed") or proof.get("merge_sha") != task.get("merge_sha")
-            or proof.get("config_sha256") != config.fingerprint
+            or not config.matches_evidence(proof, "checks")
+            or config.data["delivery"]["post_merge_checks"] and not proof.get("commands_run", True)
             or proof.get("source_tree") != (task.get("verification") or {}).get("source_tree")):
         raise RelayError("Cleanup requires successful current-config post-merge acceptance")
     policy = config.data["delivery"]
@@ -160,6 +161,7 @@ def run(config, state, task):
             step("remote_tracking_branch", tracking)
         receipt.update(status="completed", finished_at=now())
         task.update(status="completed", error=None)
+        task.pop("handoff", None)
         save()
         return task
     except (RelayError, OSError, KeyboardInterrupt) as error:

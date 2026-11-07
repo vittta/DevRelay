@@ -112,6 +112,29 @@ class WorkspaceTest(RepositoryTest):
         self.assertEqual(code, 1)
         self.assertIn("base advanced", report["error"])
 
+    def test_replacement_cannot_hide_unintegrated_member_base(self):
+        task = self.fixed()
+        member = Path(task["members"]["pro"]["worktree"])
+        self.git("add", ".", cwd=member)
+        self.git("commit", "-qm", "task implementation", cwd=member)
+        head = self.git("rev-parse", "HEAD", cwd=member)
+        (self.second / "required-base.txt").write_text("required\n")
+        self.git("add", ".", cwd=self.second)
+        self.git("commit", "-qm", "advance base", cwd=self.second)
+        base = self.git("rev-parse", "HEAD", cwd=self.second)
+        tree = self.git("rev-parse", "HEAD^{tree}", cwd=member)
+        replacement = subprocess.check_output(
+            ["git", "commit-tree", tree, "-p", base], cwd=member,
+            input="replacement\n", text=True).strip()
+        self.git("replace", head, replacement, cwd=member)
+        code, report = self.invoke("check", "fix")
+        self.assertEqual(code, 1, report)
+        self.assertIn("base advanced", report["error"])
+        self.assertFalse((member / "required-base.txt").exists())
+        self.assertEqual(self.git("rev-parse", "refs/replace/" + head, cwd=member), replacement)
+        code, report = self.invoke("submit", "fix", "--local")
+        self.assertEqual(code, 1, report)
+
     def test_check_mutation_in_another_member_is_rejected(self):
         original = self.manifest.read_text()
         command = [sys.executable, "-c", "import os; from pathlib import Path; Path(os.environ['DEVRELAY_WORKTREE_PRO'],'changed.txt').write_text('mutation')"]
@@ -296,12 +319,19 @@ class WorkspaceTest(RepositoryTest):
         self.fixed()
         with patch.dict(os.environ, DEVRELAY_TEST_REVIEW="changes_requested"):
             code, reviewed = self.invoke("review", "fix")
-            self.assertEqual(code, 0, reviewed)
+            self.assertEqual(code, 1, reviewed)
+            self.assertEqual(reviewed["status"], "review_blocked")
             self.assertEqual(reviewed['review']['verdict'], 'changes_requested')
-        self.assertEqual(self.invoke("check", "fix")[0], 0)
+        code, checked = self.invoke("check", "fix")
+        self.assertEqual(code, 0, checked)
+        self.assertTrue(checked["review_required"])
+        self.assertIsNone(checked["review"])
         code, report = self.invoke("submit", "fix", "--local")
         self.assertEqual(code, 1)
         self.assertIn("review", report["error"])
+        for key, member in checked["members"].items():
+            self.assertEqual(self.git("rev-parse", "HEAD", cwd=member["worktree"]),
+                             checked["verification"]["members"][key]["head_sha"])
         self.assertEqual(self.invoke("review", "fix")[0], 0)
         self.assertEqual(self.invoke("submit", "fix", "--local")[0], 0)
 

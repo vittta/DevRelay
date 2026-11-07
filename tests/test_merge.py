@@ -13,11 +13,93 @@ from devrelay.git import git as real_git, has_ref
 from devrelay.process import execute
 from devrelay.providers import queue_report, snapshot
 from devrelay.runner import prepare_task, run_task, start, submit, verify
+from devrelay.workflow import work
 
 from test_delivery import GitHubDeliveryFixture
 
 
 class MergeTests(GitHubDeliveryFixture):
+    def test_work_recovers_saved_pr_when_uncertain_push_did_not_reach_remote(self):
+        original = self.deliver()
+        (Path(original["worktree"]) / "follow-up.txt").write_text("next change\n")
+
+        def remote_head(pull):
+            head = self.git("--git-dir", str(self.remote), "rev-parse", original["branch"])
+            pull["headRefOid"] = head
+            pull["commits"]["nodes"][0]["commit"]["oid"] = head
+
+        def timeout_before_push(root, *argv, **kwargs):
+            if argv[0] == "push":
+                raise RelayError("Push timed out before updating the remote")
+            return real_git(root, *argv, **kwargs)
+
+        self.query_hook = remote_head
+        with self.state.lock():
+            verify(self.config, self.state, "12")
+            with patch("devrelay.runner.git", side_effect=timeout_before_push):
+                with self.assertRaisesRegex(RelayError, "Push timed out"):
+                    submit(self.config, self.state, "12")
+            saved = self.state.get("12")
+            self.assertEqual(saved["published_head"], original["head_sha"])
+            self.assertNotEqual(saved["head_sha"], original["head_sha"])
+            self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", saved["branch"]),
+                             original["head_sha"])
+            with patch("devrelay.runner.codex.implement", side_effect=AssertionError("Unexpected model")):
+                recovered = work(self.config, self.state, "12")
+        self.assertEqual(recovered["status"], "pr_open")
+        self.assertEqual(recovered["pr_url"], original["pr_url"])
+        self.assertEqual(recovered["published_head"], saved["head_sha"])
+        self.assertNotIn("push_intent", recovered)
+        self.assertEqual(self.create_count, 1)
+
+    def test_nonrequired_skipped_ci_does_not_block_merge(self):
+        self.enable(required_checks=["test"])
+        self.checks.append({"__typename": "CheckRun", "name": "unrelated-platform", "status": "COMPLETED", "conclusion": "SKIPPED"})
+        result = self.deliver()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.merge_count, 1)
+
+    def test_post_merge_commands_are_optional_but_tree_validation_and_later_enablement_remain(self):
+        self.enable(post_merge_checks=False)
+        with patch("devrelay.delivery.execute") as execute_commands:
+            result = self.deliver()
+        execute_commands.assert_not_called()
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["post_merge"]["commands_run"])
+        self.assertNotIn("post_merge_worktree", result)
+        self.assertEqual(result["post_merge"]["source_tree"], result["verification"]["source_tree"])
+        path = self.root / ".devrelay/config.toml"
+        path.write_text(path.read_text().replace("post_merge_checks = false", "post_merge_checks = true"))
+        self.config = load(self.root)
+        with self.state.lock():
+            result = merge(self.config, self.state, "12")
+        self.assertTrue(result["post_merge"]["commands_run"])
+        self.assertTrue(result["post_merge"]["checks"])
+        self.assertEqual(self.merge_count, 1)
+
+    def test_optional_post_merge_commands_never_skip_merged_tree_identity(self):
+        self.enable(post_merge_checks=False)
+        self.unexpected_tree = True
+        with self.assertRaisesRegex(RelayError, "Merged tree differs"):
+            self.deliver()
+        self.assertEqual(self.state.get("12")["status"], "post_merge_failed")
+
+    def test_disabling_post_checks_retains_the_previous_failed_worktree(self):
+        self.enable(post_merge_checks=True)
+        with patch("devrelay.delivery.execute", side_effect=RelayError("Acceptance failed")), self.assertRaises(RelayError):
+            self.deliver()
+        failed = self.state.get("12")
+        evidence = Path(failed["post_merge_path"]).read_bytes()
+        path = self.root / ".devrelay/config.toml"
+        path.write_text(path.read_text().replace("post_merge_checks = true", "post_merge_checks = false"))
+        self.config = load(self.root)
+        with self.state.lock():
+            result = merge(self.config, self.state, "12")
+        self.assertEqual(result["status"], "completed")
+        self.assertIn(failed["post_merge_worktree"], result["retained_worktrees"])
+        self.assertTrue(Path(failed["post_merge_worktree"]).is_dir())
+        self.assertEqual(Path(failed["post_merge_path"]).read_bytes(), evidence)
+
     def test_open_pr_repreparation_invalidates_review_and_requires_new_acceptance(self):
         self.enable(auto_merge=False, auto_review=True)
         task = self.deliver()
@@ -387,6 +469,23 @@ class MergeTests(GitHubDeliveryFixture):
             result = merge(self.config, self.state, "12")
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.merge_count, 1)
+
+    def test_submit_recovers_queued_merge_without_repeating_publication_or_merge_request(self):
+        self.enable(required_checks=["test"])
+        self.request_pending = True
+        waiting = self.deliver()
+        self.assertEqual(waiting["status"], "merge_waiting")
+        with self.state.lock():
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(recovered["status"], "merge_waiting")
+        self.assertEqual(recovered["merge_request"], waiting["merge_request"])
+        self.assertEqual(recovered["review"], waiting["review"])
+        self.assertEqual((self.create_count, self.edit_count, self.merge_count), (1, 0, 1))
+        self.server_merge()
+        with self.state.lock():
+            completed = submit(self.config, self.state, "12")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual((self.create_count, self.edit_count, self.merge_count), (1, 0, 1))
 
     def test_post_merge_check_failure_preserves_merged_state_and_retry_does_not_merge_again(self):
         self.enable(cleanup_branches=True, cleanup_worktrees=True)

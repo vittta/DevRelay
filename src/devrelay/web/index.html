@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DevRelay · 项目配置</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="DevRelay 首页"><span class="brand-mark">D/</span> DevRelay</a>
+    <nav id="projects" aria-label="项目列表"></nav>
+    <button id="add-project" class="project-button add-project">＋ 添加项目</button>
+  </aside>
+  <main>
+    <div class="page">
+      <div class="page-heading"><div><h1 id="project-name">读取中…</h1><p id="project-description"></p></div><div class="heading-actions"><div id="activity" class="project-status" hidden></div><button id="locate-project" class="button secondary" hidden>重新定位</button><button id="reload" class="button secondary">重新加载</button></div></div>
+      <div id="notice" role="status" aria-live="polite" hidden></div>
+      <div id="unavailable" class="panel" hidden></div>
+      <section id="empty-projects" class="panel empty-projects" hidden><button id="first-project" class="button primary">添加项目</button></section>
+      <div id="workspace" hidden>
+        <div class="editor-header"><nav id="tabs" aria-label="配置分类"></nav></div>
+        <form id="settings" novalidate></form>
+        <section id="source-panel" class="panel" hidden><label class="source-label" for="source">TOML 配置</label><textarea id="source" spellcheck="false"></textarea></section>
+        <section id="status-panel" hidden>
+          <div class="panel"><div class="panel-heading"><h2>任务</h2></div><div id="task-list"></div></div>
+          <div class="panel"><div class="panel-heading action-heading"><h2>队列与环境</h2><div class="actions"><button type="button" id="queue" class="button secondary">查询队列</button><button type="button" id="doctor" class="button secondary">环境检查</button><button type="button" id="setup-github" class="button secondary" hidden>初始化 GitHub</button></div></div><div id="diagnostics" aria-live="polite" hidden></div></div>
+          <details class="panel"><summary>项目位置与运行版本</summary><dl id="locations"></dl></details>
+        </section>
+        <footer class="savebar"><span id="save-state" role="status" aria-live="polite">已保存</span><button id="preview" class="button primary">预览变更</button></footer>
+      </div>
+    </div>
+  </main>
+  <dialog id="preview-dialog" aria-labelledby="preview-title" aria-describedby="save-effect"><div class="dialog-heading"><h2 id="preview-title">配置变更</h2><p id="save-effect">保存到本地，下次命令生效；不会启动执行器。</p><p id="impact" hidden></p><ul id="consequences" class="warning" hidden></ul><p id="preview-busy" class="warning" hidden></p></div><pre id="diff" tabindex="0" aria-label="配置差异"></pre><p id="dialog-error" class="error" role="alert" hidden></p><div class="dialog-footer"><button id="cancel" class="button secondary">继续编辑</button><button id="save" class="button primary">保存配置</button></div></dialog>
+  <dialog id="register-dialog" aria-labelledby="register-title">
+    <div class="dialog-heading"><h2 id="register-title">添加项目</h2></div>
+    <form id="register-form" class="register-body">
+      <div class="field"><div class="field-label"><label for="register-path">仓库路径</label><span id="path-help"></span></div><input id="register-path" name="path" required autocomplete="off" spellcheck="false" placeholder="/path/to/repository"></div>
+      <div class="field"><div class="field-label"><label for="register-name">项目名称（可选）</label></div><input id="register-name" name="name" maxlength="120" autocomplete="off"></div>
+      <button id="probe-project" class="button secondary" type="submit">检查仓库</button>
+    </form>
+    <section id="register-review" class="register-body" hidden>
+      <dl id="register-details"></dl>
+      <p id="register-effect"></p>
+      <p id="register-warning" class="warning" hidden></p>
+      <details><summary>项目配置</summary><pre id="register-source" tabindex="0" aria-label="待接入项目配置"></pre></details>
+    </section>
+    <p id="register-error" class="error register-body" role="alert" hidden></p>
+    <div class="dialog-footer"><button id="register-cancel" class="button secondary">取消</button><button id="register-confirm" class="button primary" disabled>添加项目</button></div>
+  </dialog>
+</body>
+</html>

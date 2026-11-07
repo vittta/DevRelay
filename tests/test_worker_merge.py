@@ -18,7 +18,7 @@ from devrelay.worker import selection
 from test_worker import WorkerFixture
 
 
-class AutoMergeWorkerTests(WorkerFixture):
+class AutoMergeWorkerFixture(WorkerFixture):
     def setUp(self):
         super().setUp()
         path = self.root / '.devrelay/config.toml'
@@ -104,6 +104,8 @@ class AutoMergeWorkerTests(WorkerFixture):
     def only_one(self):
         self.issues = [self.issue]
 
+
+class AutoMergeWorkerTests(AutoMergeWorkerFixture):
     def test_two_issues_merge_and_pass_post_checks_before_next_claim(self):
         def post_check(state, argv, cwd, log, timeout, **kwargs):
             if '-post-' in str(cwd):
@@ -184,6 +186,27 @@ class AutoMergeWorkerTests(WorkerFixture):
         sleeper.assert_not_called()
         self.assertEqual(self.merge_count, 0)
         self.assertIsNone(self.state.get('12'))
+
+    def test_failed_ci_is_repaired_rechecked_and_reviewed_before_merge(self):
+        self.only_one()
+        self.check_conclusion = 'FAILURE'
+        executable = Path(self.config.data['codex']['executable'])
+        executable.write_text(executable.read_text().replace("if mode != 'blocked':",
+            "if '\"kind\": \"ci\"' in prompt:\n    Path('ci-fixed.txt').write_text('CI regression fixed\\n')\nif mode != 'blocked':"))
+        def query(argv, cwd):
+            task = self.state.get('12')
+            if task and (Path(task['worktree']) / 'ci-fixed.txt').exists():
+                self.check_conclusion = 'SUCCESS'
+            return self.query(argv, cwd)
+        with patch('devrelay.delivery.command', side_effect=query):
+            result = self.watching(max_tasks=1)
+        self.assertEqual(result['delivered'], 1)
+        task = self.state.get('12')
+        self.assertEqual(task['workflow']['used'], 2)
+        self.assertEqual(task['status'], 'completed')
+        self.assertEqual((self.create_count, self.edit_count, self.merge_count), (1, 1, 1))
+        self.assertEqual(self.trace_count(), 4)
+        self.assertEqual(task['review']['head_sha'], task['head_sha'])
 
     def test_post_merge_failure_preserves_scene_and_stops_before_next_issue(self):
         def fail(state, argv, cwd, log, timeout, **kwargs):

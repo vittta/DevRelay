@@ -11,8 +11,8 @@ One issue delivers one observable, reviewable result. Keep its required code, co
 一个 Issue 对应一个可观察、可审查结果；实现该结果所需的代码、配置、测试和文档放在一起。
 Split child issues only for independent value or acceptance criteria, not merely by file, layer or phase.
 只有具备独立价值或验收标准才拆子项，不仅按文件、层或阶段拆分。
-Choose one primary work type, relevant area labels and exactly one priority.
-选择一个主要任务类型、相关 area 标签及唯一优先级。
+Priority is optional (default: the second configured priority, or the first if only one exists).
+优先级可选，默认使用配置中的第二档；只有一档时使用该档。不填写 Depends on 表示无依赖。
 Priorities / 优先级: ["priority:P0", "priority:P1", "priority:P2"]
 Authorization / 执行授权: "auto:approved"
 Blockers / 阻塞标签: ["blocked", "needs-input"]
@@ -39,8 +39,8 @@ Close only after full acceptance; a partial PR does not complete the issue.
 
 ## Dependencies / 依赖
 
-<!-- Keep exactly one declaration: none, or #12, #27. Dependencies must be closed
-and linked to merged PRs integrated into the configured base. / 保留唯一声明；
+<!-- Optional declaration: none, or #12, #27; omission means no dependencies.
+Dependencies must be closed and linked to merged PRs integrated into the configured base. / 声明可省略，省略表示无依赖；
 依赖须已关闭，并有关联 PR 已合并到配置的目标分支。 -->
 Depends on: none
 

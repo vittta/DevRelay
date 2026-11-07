@@ -1,0 +1,8 @@
+[
+  {
+    "title": "Reject empty filenames before exporting",
+    "description": "The export path accepts an empty filename and fails with an unhandled filesystem error. This behavior also exists on the unchanged base and is independent of the current task.",
+    "evidence": "On the base revision, call the export action with filename=''. Expected: a validation message before writing. Observed: FileNotFoundError. Include the project's actual reproduction command and observed result in a real report.",
+    "acceptance": "An empty filename returns a clear validation error without writing files; a valid filename still exports successfully. Cover both behaviors with the project's tests."
+  }
+]

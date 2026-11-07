@@ -697,7 +697,7 @@ def dispatch(args):
                     pending, key=lambda t: (t.get("priority", "priority:P1"), t["created_at"]))
                 return {"selected": ordered[0] if ordered else None}
             if args.command == "task" and args.task_command == "add":
-                return add(workspace, state, args.id, args.title, args.file, args.priority)
+                return add(workspace, state, args.id, args.title, args.file, args.priority or "priority:P1")
             if args.command not in ("start", "prepare", "check", "submit", "run", "resume", "review") and not (args.command == "task" and args.task_command == "revoke"):
                 raise RelayError("Workspace MVP supports task add/list/revoke, next/status/doctor, start/prepare/check/review/run/resume/submit; no automatic merge")
             if not args.id:

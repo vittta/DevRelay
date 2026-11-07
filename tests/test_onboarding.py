@@ -65,13 +65,12 @@ class GitHubOnboardingTests(RepositoryTest):
         original = dict(self.labels["bug"])
         result = setup_github(self.config)
         expected = {"bug", "enhancement", "documentation", "experiment", "infrastructure",
-                    "area:backend", "area:benchmark", "area:cloth", "area:contact",
-                    "area:evaluation", "area:hardware", "auto:approved", "priority:P0",
+                    "auto:approved", "priority:P0",
                     "priority:P1", "priority:P2", "blocked", "needs-input", "scope:plan"}
         self.assertEqual(set(self.labels), expected)
         self.assertEqual(self.labels["bug"], original)
         self.assertEqual(result["labels"]["preserved"], ["bug"])
-        self.assertEqual(len(result["labels"]["created"]), 17)
+        self.assertEqual(len(result["labels"]["created"]), 11)
         self.assertEqual(len(result["templates"]["created"]), 4)
         for filename in result["templates"]["created"]:
             text = (self.root / filename).read_text()
@@ -132,13 +131,13 @@ class GitHubOnboardingTests(RepositoryTest):
 
     def test_partial_remote_failure_is_reported_and_sync_recovers_without_overwriting_config(self):
         (self.root / ".devrelay/config.toml").unlink()
-        self.failure = "area:backend"
+        self.failure = "scope:plan"
         code, error = self.invoke()
         self.assertEqual(code, 1)
         self.assertIn("init --sync-github", error["error"])
         original = (self.root / ".devrelay/config.toml").read_bytes()
         self.assertIn("enhancement", self.labels)
-        self.assertNotIn("area:backend", self.labels)
+        self.assertNotIn("scope:plan", self.labels)
         self.failure = None
         code, result = self.invoke("--sync-github")
         self.assertEqual(code, 0)

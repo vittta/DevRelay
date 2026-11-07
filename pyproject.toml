@@ -15,3 +15,6 @@ devrelay = "devrelay.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+devrelay = ["web/*.html", "web/*.css", "web/*.js"]

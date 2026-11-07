@@ -5,7 +5,9 @@ from pathlib import Path
 import re
 
 from .errors import RelayError
+from .discovery import instructions as discovery_instructions, result_schema, validate as validate_discoveries
 from .process import execute
+from .triage import implementation_context
 
 
 RESULT_SCHEMA = {
@@ -313,6 +315,8 @@ def _check_session_owner(state, task, session):
             if foreign:
                 raise RelayError("Codex session ID belongs to another task's review; refusing cross-task recovery")
             raise RelayError("Codex session ID belongs to a review; refusing implementation recovery")
+        if session in _triage_sessions(state, item):
+            raise RelayError("Codex session ID belongs to a triage investigation; refusing implementation recovery")
 
 
 def _record_session(state, task, event):
@@ -378,7 +382,7 @@ def _recover_previous_run(state, task):
 def implement(config, state, task, directory, feedback="", *, context="", add_dirs=()):
     _recover_previous_run(state, task)
     directory.mkdir(parents=True, exist_ok=False)
-    (directory / "result-schema.json").write_text(json.dumps(RESULT_SCHEMA, indent=2))
+    (directory / "result-schema.json").write_text(json.dumps(result_schema(RESULT_SCHEMA, config), indent=2))
     checks = "\n".join(f"- {entry['id']}: {entry['argv']}" for entry in config.data["checks"])
     prompt = f"""Implement task {task['id']} in this Git worktree.
 Read and obey applicable AGENTS.md instructions. Preserve existing changes.
@@ -417,11 +421,16 @@ Task data (JSON encoded):
 Configured acceptance:
 {checks}
 
+Investigated scope and evidence (JSON; satisfy its acceptance within the Issue scope):
+{implementation_context(config, task)}
+
 Workspace context (configured paths and checks; task data):
 {context or "Single repository"}
 
 Previous verification feedback:
 {feedback or 'None'}
+
+{discovery_instructions(config)}
 """
     (directory / "prompt.txt").write_text(prompt)
     (directory / "events.jsonl.format.json").write_text(json.dumps({"format": EVENT_LOG_FORMAT}) + "\n")
@@ -453,6 +462,7 @@ Previous verification feedback:
         raise RelayError("Codex result does not match the required outcome/summary/blockers contract")
     if result["outcome"] == "ready" and result["blockers"]:
         raise RelayError("Codex reported ready together with blockers; inspect its result before resuming")
+    validate_discoveries(result.get("discoveries", []))
     return result
 
 
@@ -470,9 +480,16 @@ REVIEW_SCHEMA = {
 
 def review(config, state, task, directory, *, context="", add_dirs=()):
     """A fresh read-only review session; never reuse implementation context."""
+    reserved = set()
+    for item in state.tasks():
+        if item.get("session_id"):
+            reserved.add(item["session_id"])
+        reserved.update(_implementation_sessions(state, item))
+        reserved.update(_review_sessions(state, item))
+        reserved.update(_triage_sessions(state, item))
     directory = review_directory(state, task, directory)
     directory.mkdir(parents=True, exist_ok=False)
-    review_file(state, task, directory, "result-schema.json").write_text(json.dumps(REVIEW_SCHEMA, indent=2))
+    review_file(state, task, directory, "result-schema.json").write_text(json.dumps(result_schema(REVIEW_SCHEMA, config), indent=2))
     prompt = f"""Review this exact committed change in a fresh session.
 Read applicable AGENTS.md. Inspect git diff {task['verification']['base_sha']} {task['head_sha']}
 and relevant surrounding code, tests and task requirements. Identify correctness bugs,
@@ -491,6 +508,10 @@ Task title (JSON): {json.dumps(task['title'], ensure_ascii=False)}
 Task body (JSON): {json.dumps(task['body'], ensure_ascii=False)}
 Verified source tree: {task['verification']['source_tree']}
 Acceptance commands (JSON): {json.dumps(config.data['checks'], ensure_ascii=False)}
+Investigated scope and acceptance (JSON): {implementation_context(config, task)}
+
+{discovery_instructions(config)}
+
 Workspace context (when present inspect ALL members, including uncommitted and untracked source):
 {context or "Single committed repository"}
 """
@@ -498,7 +519,10 @@ Workspace context (when present inspect ALL members, including uncommitted and u
     review_file(state, task, directory, "result.json")
     execute(state, build_command(config, directory, sandbox="read-only", add_dirs=add_dirs), task["worktree"],
             directory / "events.jsonl", config.data["codex"]["timeout_seconds"], input=prompt)
-    return read_review(state, task, directory)
+    result = read_review(state, task, directory)
+    if result["session_id"] in reserved:
+        raise RelayError("Codex review reused a previously owned session; a fresh independent session is required")
+    return result
 
 
 def review_directory(state, task, directory):
@@ -545,11 +569,64 @@ def read_review(state, task, directory):
         result = json.loads(review_file(state, task, directory, "result.json").read_text())
     except (OSError, ValueError) as error:
         raise RelayError("Codex review produced no valid structured result") from error
-    if (not isinstance(result, dict) or set(result) != {"verdict", "summary", "findings"}
+    if (not isinstance(result, dict) or set(result) - {"discoveries"} != {"verdict", "summary", "findings"}
             or result["verdict"] not in ("approve", "changes_requested", "blocked")
             or not isinstance(result["summary"], str) or not result["summary"].strip()
             or not isinstance(result["findings"], list)
             or any(not isinstance(item, str) or not item.strip() for item in result["findings"])
             or (result["verdict"] == "approve" and result["findings"])):
         raise RelayError("Codex review result does not match the verdict/summary/findings contract")
+    validate_discoveries(result.get("discoveries", []))
     return {**result, "session_id": next(iter(sessions))}
+
+
+def _triage_sessions(state, task):
+    root = _run_root(state, task, "triage")
+    sessions = set()
+    for directory in _run_children(root, "triage"):
+        if not directory.name.endswith("-triage"):
+            continue
+        if directory.is_symlink() or directory.resolve().parent != root:
+            raise RelayError("Saved triage evidence is outside its owned run directory")
+        log = directory / "events.jsonl"
+        sessions.update(_ownership_sessions(_event_lines(log), log, legacy=_legacy_event_log(log)))
+    return sessions
+
+
+def triage(config, state, task, directory, worktree):
+    """Fresh investigation context; never own or resume the implementation session."""
+    root = _run_root(state, task, "triage")
+    if directory.is_symlink() or directory.resolve().parent != root or not directory.name.endswith("-triage"):
+        raise RelayError("Triage run is outside its owned directory")
+    for filename in ("prompt.txt", "result-schema.json", "events.jsonl", "result.json"):
+        if (directory / filename).is_symlink():
+            raise RelayError("Triage files must stay in their owned directory")
+    reserved = set()
+    for item in state.tasks():
+        if item.get("session_id"):
+            reserved.add(item["session_id"])
+        reserved.update(_implementation_sessions(state, item))
+        reserved.update(_review_sessions(state, item))
+        reserved.update(_triage_sessions(state, item))
+    log = directory / "events.jsonl"
+    (directory / "events.jsonl.format.json").write_text(json.dumps({"format": EVENT_LOG_FORMAT}) + "\n")
+    execute(state, build_command(config, directory), worktree, log, config.data["codex"]["timeout_seconds"],
+            input=(directory / "prompt.txt").read_text(), on_output_line=lambda line: _parse_event(line, log))
+    sessions, completed, failed = set(), False, False
+    for line in _event_lines(log):
+        event = _parse_event(line, log)
+        if event:
+            if event.get("type") == "thread.started":
+                if not _valid_session(event.get("thread_id")):
+                    raise RelayError("Invalid triage session ID")
+                sessions.add(event["thread_id"])
+            completed |= event.get("type") == "turn.completed"
+            failed |= event.get("type") == "turn.failed"
+    if len(sessions) != 1 or sessions & reserved or not completed or failed:
+        raise RelayError("Triage did not complete in a fresh independent session")
+    if (directory / "result.json").is_symlink():
+        raise RelayError("Triage result must stay in its owned directory")
+    try:
+        return json.loads((directory / "result.json").read_text())
+    except (OSError, ValueError) as error:
+        raise RelayError("Triage produced no valid structured result") from error

@@ -7,6 +7,7 @@ import re
 from .errors import RelayError
 from .git import command, git, is_ancestor, validate_remote, worktrees
 from .state import now
+from .triage import author_reason, authorization_reason, automatic, automatic_enabled, current as current_triage, identity as triage_identity
 
 
 ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
@@ -33,8 +34,10 @@ def task_id(value):
 
 def dependencies(body, *, github=False):
     lines = re.findall(r"^Depends on:[ \t]*(.*)$", body, re.M)
+    if not lines:
+        return []
     if len(lines) != 1:
-        raise RelayError("Exactly one 'Depends on: none' or 'Depends on: #ID, #ID' line is required")
+        raise RelayError("Use at most one 'Depends on: none' or 'Depends on: #ID, #ID' line")
     value = lines[0].strip()
     if value == "none":
         return []
@@ -47,8 +50,19 @@ def dependencies(body, *, github=False):
     return identifiers
 
 
-def linked_ids(pull, prefix):
-    identifiers = {str(item["number"]) for item in pull.get("closingIssuesReferences", [])}
+def closing_ids(pull, repository):
+    identifiers = set()
+    for item in pull.get("closingIssuesReferences", []):
+        match = re.fullmatch(r"https://github\.com/([^/]+/[^/]+)/issues/([1-9]\d*)/?",
+                             item.get("url", ""), re.I)
+        if (match and match[1].casefold() == repository.casefold()
+                and match[2] == str(item.get("number"))):
+            identifiers.add(match[2])
+    return identifiers
+
+
+def linked_ids(pull, prefix, repository):
+    identifiers = closing_ids(pull, repository)
     branch = pull.get("headRefName", "")
     if branch.startswith(prefix):
         value = branch[len(prefix):]
@@ -78,7 +92,53 @@ class Snapshot:
     integrated: set
 
 
+def paginated_inventory(config, kind):
+    """Walk repository connections, avoiding the CLI search inventory ceiling."""
+    fields = ("number title body state url createdAt author{login} labels(first:100){nodes{name} pageInfo{hasNextPage}}"
+              if kind == "issues" else
+              "number headRefName state baseRefName mergeCommit{oid} body url "
+              "closingIssuesReferences(first:100){nodes{number url} pageInfo{hasNextPage}}")
+    query = ("query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){"
+             + kind + "(first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{"
+             + fields + "} pageInfo{hasNextPage endCursor}}}}")
+    owner, name = config.repo.split("/")
+    items, seen, cursors, cursor = [], set(), set(), None
+    while True:
+        argv = ["gh", "api", "--hostname", "github.com", "graphql", "-f", "query=" + query,
+                "-f", "owner=" + owner, "-f", "name=" + name]
+        if cursor:
+            argv += ["-f", "cursor=" + cursor]
+        try:
+            response = json.loads(command(argv, config.root))
+            if response.get("errors"):
+                raise ValueError("GraphQL errors")
+            connection = response["data"]["repository"][kind]
+            nodes, page = connection["nodes"], connection["pageInfo"]
+            if not isinstance(nodes, list) or type(page["hasNextPage"]) is not bool:
+                raise ValueError("Invalid page")
+            for item in nodes:
+                number = item["number"]
+                if type(number) is not int or number <= 0 or number in seen:
+                    raise ValueError("Duplicate or invalid item")
+                seen.add(number)
+                field = "labels" if kind == "issues" else "closingIssuesReferences"
+                nested = item[field]
+                if nested["pageInfo"]["hasNextPage"] is not False or not isinstance(nested["nodes"], list):
+                    raise ValueError("Truncated item relationships")
+                item[field] = nested["nodes"]
+                items.append(item)
+            if not page["hasNextPage"]:
+                return items
+            cursor = page["endCursor"]
+            if not nodes or not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise ValueError("Pagination did not advance")
+            cursors.add(cursor)
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            raise RelayError(f"GitHub returned incomplete or invalid {kind} inventory; retry the snapshot") from error
+
+
 def snapshot(config, state, *, ignore_state_claim=None):
+    from .discovery import attach_sources
     claimed = {item["id"] for item in state.tasks()
                if (item["status"] != "completed" or config.provider == "github" and item.get("pr_url"))
                and item["id"] != ignore_state_claim
@@ -91,79 +151,112 @@ def snapshot(config, state, *, ignore_state_claim=None):
         tasks = state.tasks()
         integrated = {item["id"] for item in tasks if item["status"] == "completed"
                       and item.get("head_sha") and is_ancestor(config.root, item["head_sha"], config.base_ref)}
-        return Snapshot(tasks, claimed, integrated)
+        return Snapshot(attach_sources(config, state, tasks), claimed, integrated)
     validate_remote(config)
     git(config.root, "fetch", config.remote, config.base)
     issues = gh_json(config, "issue", "list", "--state", "all", "--limit", "1000", "--json",
-                     "number,title,body,state,labels,url,createdAt")
+                     "number,title,body,state,labels,url,createdAt,author")
     pulls = gh_json(config, "pr", "list", "--state", "all", "--limit", "1000", "--json",
                     "number,headRefName,state,baseRefName,mergeCommit,closingIssuesReferences,body,url")
-    if len(issues) >= 1000 or len(pulls) >= 1000:
-        raise RelayError("GitHub inventory limit reached; refusing an incomplete queue snapshot")
+    if len(issues) >= 1000:
+        issues = paginated_inventory(config, "issues")
+    if len(pulls) >= 1000:
+        pulls = paginated_inventory(config, "pullRequests")
     integrated = set()
     for pull in pulls:
         if pull["state"] == "OPEN":
-            claimed.update(linked_ids(pull, config.prefix))
+            claimed.update(linked_ids(pull, config.prefix, config.repo))
         oid = (pull.get("mergeCommit") or {}).get("oid", "")
         if (pull["state"] == "MERGED" and pull["baseRefName"] == config.base
                 and re.fullmatch(r"[0-9a-f]{40,64}", oid)
                 and is_ancestor(config.root, oid, config.base_ref)):
-            integrated.update(str(item["number"]) for item in pull["closingIssuesReferences"])
+            integrated.update(closing_ids(pull, config.repo))
     tasks = [{"id": str(item["number"]), "title": item["title"], "body": item["body"] or "",
               "open": item["state"] == "OPEN", "labels": [label["name"] for label in item["labels"]],
-              "created_at": item["createdAt"], "url": item["url"]} for item in issues]
-    return Snapshot(tasks, claimed, integrated)
+              "created_at": item["createdAt"], "url": item["url"],
+              "author": (item.get("author") or {}).get("login")} for item in issues]
+    saved = {item["id"]: item for item in state.tasks()}
+    for task in tasks:
+        if saved.get(task["id"], {}).get("triage"):
+            task["triage"] = saved[task["id"]]["triage"]
+    return Snapshot(attach_sources(config, state, tasks), claimed, integrated)
 
 
-def queue_report(config, view, *, exclude_claimed=True):
+def queue_report(config, view, *, exclude_claimed=True, require_authorization=True):
     queue = config.data["queue"]
     by_id = {item["id"]: item for item in view.tasks}
+    declarations, validation = {}, {}
+
+    def declaration(identifier):
+        if identifier not in declarations:
+            item = by_id.get(identifier)
+            if item is None:
+                declarations[identifier] = ([], [f"Unknown dependency #{identifier}"])
+            else:
+                try:
+                    declarations[identifier] = (dependencies(item["body"], github=config.provider == "github"), [])
+                except RelayError as error:
+                    historical = not item.get("open", True) and not re.search(r"^Depends on:", item["body"], re.M)
+                    declarations[identifier] = ([], [] if historical else [str(error)])
+        return declarations[identifier]
+
     def dependency_errors(identifier, trail=()):
         if len(trail) > 64:
             return ["Dependency chain exceeds the supported depth (64)"]
         if identifier in trail:
-            return ["Dependency cycle: " + " -> ".join((*trail, identifier))]
-        item = by_id.get(identifier)
-        if item is None:
-            return [f"Unknown dependency #{identifier}"]
-        try:
-            required = dependencies(item["body"], github=config.provider == "github")
-        except RelayError as error:
-            if not item.get("open", True) and not re.search(r"^Depends on:", item["body"], re.M):
-                return []  # Closed historical issues may predate the template.
-            return [str(error)]
-        errors = []
-        for dependency in required:
-            errors.extend(dependency_errors(dependency, (*trail, identifier)))
-            target = by_id.get(dependency)
-            if target and (target.get("open", True) or dependency not in view.integrated):
-                errors.append(f"Dependency #{dependency} is not closed and integrated into the base")
-        return errors
-    eligible, excluded = [], []
+            cycle = (*trail[trail.index(identifier):], identifier)
+            return ["Dependency cycle: " + " -> ".join(cycle)]
+        key = (identifier, len(trail))
+        if key not in validation:
+            required, errors = declaration(identifier)
+            errors = list(errors)
+            for dependency in required:
+                errors.extend(dependency_errors(dependency, (*trail, identifier)))
+                target = by_id.get(dependency)
+                if target and (target.get("open", True) or dependency not in view.integrated):
+                    errors.append(f"Dependency #{dependency} is not closed and integrated into the base")
+            validation[key] = tuple(dict.fromkeys(errors))
+        return validation[key]
+
+    eligible, excluded, investigations = [], [], []
     for task in view.tasks:
         if not task.get("open", True):
             continue
         labels = set(task["labels"])
         reasons = []
+        author = author_reason(config, task)
+        if author:
+            reasons.append(author)  # Investigation also enforces authors, before authorization exists.
         if is_tracking_parent(task):
             reasons.append("Tracking plan parents are not executable; authorize independently deliverable child issues")
-        if queue["approval_label"] not in labels:
-            reasons.append(f"Missing {queue['approval_label']}")
         reasons.extend(label for label in queue["blockers"] if label in labels)
-        if len(labels.intersection(queue["priorities"])) != 1:
-            reasons.append("Exactly one priority label is required")
+        if len(labels.intersection(queue["priorities"])) > 1:
+            reasons.append("At most one priority label is allowed")
         if not task.get("created_at"):
             reasons.append("Creation time is missing")
         reasons.extend(dependency_errors(task["id"]))
         if exclude_claimed and task["id"] in view.claimed:
             reasons.append("Existing work or PR; resume it instead of claiming again")
+        authorization = authorization_reason(config, task) if require_authorization else None
+        record = task.get("triage") or {}
+        if (not reasons and authorization and automatic(config, task) and not current_triage(config, task)
+                and (record.get("identity") != triage_identity(config, task) or record.get("phase") == "done")):
+            investigations.append(task)
+        if authorization:
+            reasons.append(authorization)
         if reasons:
             excluded.append({"id": task["id"], "reasons": list(dict.fromkeys(reasons))})
         else:
             eligible.append(task)
-    eligible.sort(key=lambda item: (next(i for i, label in enumerate(queue["priorities"]) if label in item["labels"]),
-                                   item["created_at"], item["id"]))
-    return {"selected": eligible[0] if eligible else None, "eligible": eligible, "excluded": excluded}
+    def order(item):
+        return (next((i for i, label in enumerate(queue["priorities"]) if label in item["labels"]),
+                     min(1, len(queue["priorities"]) - 1)), item["created_at"], item["id"])
+    eligible.sort(key=order)
+    investigations.sort(key=order)
+    result = {"selected": eligible[0] if eligible else None, "eligible": eligible, "excluded": excluded}
+    if automatic_enabled(config):
+        result["triage_candidates"] = investigations
+    return result
 
 
 def authorized(config, state, identifier):
@@ -185,11 +278,25 @@ def add_local(config, state, identifier, title, body, priority):
         raise RelayError(f"Task {identifier} already exists; left unchanged")
     if not title.strip() or not body.strip():
         raise RelayError("Provide a task title and a nonempty task file")
-    if priority not in config.data["queue"]["priorities"]:
+    if priority is not None and priority not in config.data["queue"]["priorities"]:
         raise RelayError("Priority must match a configured queue priority label")
     if not re.search(r"^Depends on:", body, re.M):
         body = body.rstrip() + "\n\nDepends on: none\n"
     dependencies(body)
     return state.save({"id": identifier, "title": title, "body": body, "open": True,
-                       "labels": [config.data["queue"]["approval_label"], priority],
+                       "labels": [config.data["queue"]["approval_label"]] + ([priority] if priority else []),
                        "created_at": now(), "status": "queued", "attempts": 0})
+
+
+def approve_local(config, state, identifier):
+    if config.provider != "local":
+        raise RelayError("task approve is for provider=local; apply the configured approval label on GitHub")
+    task = state.get(task_id(identifier))
+    if not task or task["status"] != "queued" or task.get("worktree") or not task.get("open", True):
+        raise RelayError("Only an open, unclaimed local task can be approved")
+    if is_tracking_parent(task):
+        raise RelayError("Tracking plan parents are not executable; authorize bounded child tasks")
+    label = config.data["queue"]["approval_label"]
+    if label not in task["labels"]:
+        task["labels"].append(label)
+    return state.save(task)

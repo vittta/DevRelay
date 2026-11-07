@@ -6,6 +6,7 @@ import re
 import uuid
 
 from . import codex
+from .discovery import attach_sources, capture
 from .cleanup import run as cleanup
 from .errors import RelayError
 from .git import command, git, is_ancestor, source_tree, validate_remote
@@ -13,6 +14,7 @@ from .process import execute
 from .providers import authorized, gh, task_id
 from .runner import assert_config, base_commit, claimed_task, require_prepared
 from .state import now
+from .triage import scope_digest
 
 
 PULL_QUERY = """query($owner:String!,$name:String!,$number:Int!){
@@ -23,8 +25,8 @@ PULL_QUERY = """query($owner:String!,$name:String!,$number:Int!){
   reviewThreads(first:100){nodes{isResolved} pageInfo{hasNextPage}}
   latestReviews(first:100){nodes{state} pageInfo{hasNextPage}}
   commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){
-   nodes{__typename ... on CheckRun{name status conclusion}
-    ... on StatusContext{context state}} pageInfo{hasNextPage}
+   nodes{__typename ... on CheckRun{name status conclusion detailsUrl}
+    ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage}
   }}}}}
  }}
 }"""
@@ -83,13 +85,19 @@ def _connection(value):
 def identity(task, config):
     record = task["verification"]
     return {"head_sha": task["head_sha"], "base_sha": record["base_sha"],
-            "source_tree": record["source_tree"], "config_sha256": config.fingerprint,
-            "task_body": record["task_body"], "task_title": record["task_title"], "pr_url": task["pr_url"]}
+            "source_tree": record["source_tree"], "config_sha256": config.stage_fingerprint("review"),
+            "task_body": record["task_body"], "task_title": record["task_title"], "pr_url": task["pr_url"],
+            **({"scope_sha256": record["scope_sha256"]} if record.get("scope_sha256") else {})}
 
 
 def current_review(task, config):
     record = task.get("review") or {}
-    return bool(record) and all(record.get(key) == value for key, value in identity(task, config).items())
+    return bool(record and task.get("verification")) and all(record.get(key) == value for key, value in identity(task, config).items())
+
+
+def request_identity(task, config):
+    # Delivery policy changes still invalidate a queued mutation, without rerunning setup/checks.
+    return {**identity(task, config), "delivery_sha256": config.stage_fingerprint("delivery")}
 
 
 def open_evidence(config, state, task, pull):
@@ -98,8 +106,9 @@ def open_evidence(config, state, task, pull):
     fresh = authorized(config, state, task["id"])
     record = task.get("verification") or {}
     path = Path(task["worktree"])
-    if (not record.get("passed") or record.get("config_sha256") != config.fingerprint
+    if (not record.get("passed") or not config.matches_evidence(record, "checks")
             or record.get("task_body") != fresh["body"] or record.get("task_title") != fresh["title"]
+            or record.get("scope_sha256") != scope_digest(config, fresh)
             or not task.get("head_sha") or git(path, "rev-parse", "HEAD") != task["head_sha"]
             or git(path, "rev-parse", "HEAD^{tree}") != record.get("source_tree")
             or source_tree(path) != record.get("source_tree")):
@@ -150,6 +159,10 @@ def review(config, state, identifier, *, recover=False):
                     status="reviewed" if result["verdict"] == "approve" else "review_blocked")
         if result["verdict"] != "approve":
             task["error"] = "; ".join(result["findings"]) or result["summary"]
+        else:
+            task.pop("handoff", None)
+        state.save(task)
+        task = capture(config, state, task, result, origin="review", report_path=directory / "result.json")
         return state.save(task)
     except (RelayError, OSError, KeyboardInterrupt) as error:
         task.update(status="review_blocked", review=None, error=str(error) or "Review interrupted")
@@ -159,6 +172,7 @@ def review(config, state, identifier, *, recover=False):
 
 def gate_reasons(config, pull):
     reasons, seen = [], set()
+    required = config.data["delivery"]["required_checks"]
     if pull["isDraft"]:
         reasons.append("PR is still draft")
     if pull["mergeable"] != "MERGEABLE" or pull["mergeStateStatus"] != "CLEAN":
@@ -174,7 +188,8 @@ def gate_reasons(config, pull):
     for item in pull["checks"]:
         if item.get("__typename") == "CheckRun":
             name = item.get("name")
-            passed = item.get("status") == "COMPLETED" and item.get("conclusion") == "SUCCESS"
+            passed = item.get("status") == "COMPLETED" and (item.get("conclusion") == "SUCCESS"
+                     or item.get("conclusion") == "SKIPPED" and name not in required)
         elif item.get("__typename") == "StatusContext":
             name = item.get("context")
             passed = item.get("state") == "SUCCESS"
@@ -194,9 +209,10 @@ def gate_reasons(config, pull):
     return list(dict.fromkeys(reasons))
 
 
-def blocking_gates(pull):
+def blocking_gates(pull, config=None):
     """Permanent failures stop watch; pending CI/approvals/protection may be polled."""
     blockers = []
+    required = config.data["delivery"]["required_checks"] if config else []
     if pull["mergeable"] == "CONFLICTING" or pull["mergeStateStatus"] == "DIRTY":
         blockers.append("Merge conflict")
     if pull["reviewDecision"] == "CHANGES_REQUESTED":
@@ -211,7 +227,9 @@ def blocking_gates(pull):
         if (not isinstance(item.get("name" if kind == "CheckRun" else "context"), str)
                 or not item.get("name" if kind == "CheckRun" else "context")
                 or kind == "CheckRun" and item.get("status") not in ("COMPLETED", "QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED")
-                or kind == "CheckRun" and item.get("status") == "COMPLETED" and item.get("conclusion") != "SUCCESS"
+                or kind == "CheckRun" and item.get("status") == "COMPLETED"
+                and not (item.get("conclusion") == "SUCCESS" or item.get("conclusion") == "SKIPPED"
+                         and item.get("name") not in required)
                 or kind == "StatusContext" and item.get("state") not in ("SUCCESS", "PENDING")
                 or kind not in ("CheckRun", "StatusContext")):
             blockers.append("Failed or unknown CI check")
@@ -275,11 +293,14 @@ def post_merge(config, state, task, pull):
         retained = task.setdefault("retained_worktrees", [])
         if previous not in retained:
             retained.append(previous)
+        task.pop("post_merge_worktree", None)  # A policy change must not clean a failed acceptance checkout.
     task.update(status="merged", merge_sha=oid, error=None)
     state.save(task)
     directory = state.directory / "runs" / task["id"] / (uuid.uuid4().hex + "-post-merge")
     directory.mkdir(parents=True)
-    record = {"passed": False, "merge_sha": oid, "config_sha256": config.fingerprint, "checks": [], "setup": []}
+    record = {"passed": False, "merge_sha": oid, "config_sha256": config.fingerprint,
+              "checks_sha256": config.stage_fingerprint("checks"), "checks": [], "setup": [],
+              "commands_run": config.data["delivery"]["post_merge_checks"]}
     path = config.root / ".devrelay/worktrees" / (task["id"] + "-post-" + uuid.uuid4().hex)
     try:
         assert_config(config)
@@ -290,12 +311,13 @@ def post_merge(config, state, task, pull):
         record["source_tree"] = tree
         if tree != task["verification"]["source_tree"]:
             raise RelayError("Merged tree differs from the reviewed source; inspect the base/merge race before continuing")
-        if not config.data["checks"]:
+        if record["commands_run"] and not config.data["checks"]:
             raise RelayError("No post-merge acceptance commands configured")
-        git(config.root, "worktree", "add", "--detach", str(path), oid)
-        task["post_merge_worktree"] = str(path)
-        state.save(task)
-        for phase in ("setup", "checks"):
+        if record["commands_run"]:
+            git(config.root, "worktree", "add", "--detach", str(path), oid)
+            task["post_merge_worktree"] = str(path)
+            state.save(task)
+        for phase in (("setup", "checks") if record["commands_run"] else ()):
             if phase == "checks" and (source_tree(path) != tree or git(path, "rev-parse", "HEAD") != oid):
                 raise RelayError("Source or HEAD changed during post-merge setup")
             for entry in config.data[phase]:
@@ -304,7 +326,7 @@ def post_merge(config, state, task, pull):
                 if phase == "checks" and (source_tree(path) != tree or git(path, "rev-parse", "HEAD") != oid):
                     raise RelayError("Source or HEAD changed during post-merge acceptance")
         assert_config(config)
-        if source_tree(path) != tree or git(path, "rev-parse", "HEAD") != oid:
+        if record["commands_run"] and (source_tree(path) != tree or git(path, "rev-parse", "HEAD") != oid):
             raise RelayError("Source or HEAD changed during post-merge acceptance")
         base_commit(config)
         if not is_ancestor(config.root, oid, config.base_ref):
@@ -351,7 +373,8 @@ def _merge(config, state, identifier, *, retry_request=False):
     pull = pull_snapshot(config, task)
     if pull["state"] == "MERGED":
         if ((task.get("post_merge") or {}).get("passed")
-                and task["post_merge"].get("config_sha256") == config.fingerprint):
+                and config.matches_evidence(task["post_merge"], "checks")
+                and (not config.data["delivery"]["post_merge_checks"] or task["post_merge"].get("commands_run", True))):
             if (pull["headRefOid"] != task["head_sha"] or pull["headRefName"] != task["branch"]
                     or pull["baseRefName"] != config.base or pull["isCrossRepository"]
                     or (pull["mergeCommit"] or {}).get("oid") != task["merge_sha"]):
@@ -370,10 +393,10 @@ def _merge(config, state, identifier, *, retry_request=False):
     if request:
         if not current_review(task, config) or task["review"]["verdict"] != "approve":
             raise RelayError("Pending merge has no current approved independent review")
-        if pending and not all(request.get(key) == value for key, value in identity(task, config).items()):
+        if pending and not all(request.get(key) == value for key, value in request_identity(task, config).items()):
             raise RelayError("Saved merge request evidence differs; inspect it before retrying")
         if pending:
-            blockers = blocking_gates(pull)
+            blockers = blocking_gates(pull, config)
             if blockers:
                 raise RelayError("; ".join(blockers))
             task.update(status="merge_waiting", error="Merge request is pending on GitHub")
@@ -392,7 +415,8 @@ def _merge(config, state, identifier, *, retry_request=False):
     if not current_review(task, config):
         task = review(config, state, identifier, recover=task["status"] == "reviewing")
     if task["review"]["verdict"] != "approve":
-        return task
+        task.update(status="review_blocked", error="; ".join(task["review"]["findings"]) or task["review"]["summary"])
+        return state.save(task)
     pull = pull_snapshot(config, task)
     open_evidence(config, state, task, pull)
     if pull["isDraft"]:
@@ -401,7 +425,7 @@ def _merge(config, state, identifier, *, retry_request=False):
     open_evidence(config, state, task, pull)
     reasons = gate_reasons(config, pull)
     task["merge_gates"] = {"head_sha": task["head_sha"], "base_sha": pull["baseRefOid"],
-                           "checked_at": now(), "reasons": reasons, "blockers": blocking_gates(pull), "checks": pull["checks"]}
+                           "checked_at": now(), "reasons": reasons, "blockers": blocking_gates(pull, config), "checks": pull["checks"]}
     if reasons:
         task.update(status="merge_waiting", error="; ".join(reasons))
         return state.save(task)
@@ -415,11 +439,11 @@ def _merge(config, state, identifier, *, retry_request=False):
     reasons = gate_reasons(config, pull)
     if reasons:
         task.update(status="merge_waiting", error="; ".join(reasons))
-        task["merge_gates"].update(reasons=reasons, blockers=blocking_gates(pull), checked_at=now(), checks=pull["checks"])
+        task["merge_gates"].update(reasons=reasons, blockers=blocking_gates(pull, config), checked_at=now(), checks=pull["checks"])
         return state.save(task)
     if pull.get("mergeQueueEntry") or pull.get("autoMergeRequest"):
         raise RelayError("PR acquired a remote pending merge; inspect GitHub before continuing")
-    task["merge_request"] = {**identity(task, config), "state": "started", "requested_at": now()}
+    task["merge_request"] = {**request_identity(task, config), "state": "started", "requested_at": now()}
     state.save(task)  # Crash/timeout after this point must never silently resend the mutation.
     request_error = None
     try:
@@ -440,12 +464,19 @@ def _merge(config, state, identifier, *, retry_request=False):
     return state.save(task)
 
 
+def automatic_review(config, task):
+    return config.provider == "github" and (config.data["delivery"]["auto_review"]
+            or config.data["delivery"]["auto_merge"]
+            or bool(task.get("discovery_source") and config.data["discovery"]["auto_review"]))
+
+
 def advance(config, state, identifier):
     """After an explicit submit, run only the delivery phases enabled by this project."""
     settings = config.data["delivery"]
     if settings["auto_merge"]:
         return merge(config, state, identifier)
-    if settings["auto_review"]:
+    saved = state.get(str(identifier))
+    if saved and automatic_review(config, attach_sources(config, state, [saved])[0]):
         task = claimed_task(config, state, identifier)
         if current_review(task, config):
             try:
@@ -454,6 +485,9 @@ def advance(config, state, identifier):
                 task.update(status="review_blocked", review=None, error=str(error))
                 state.save(task)
                 raise
-            return task
+            verdict = task["review"]["verdict"]
+            task.update(status="reviewed" if verdict == "approve" else "review_blocked",
+                        error=None if verdict == "approve" else "; ".join(task["review"]["findings"]) or task["review"]["summary"])
+            return state.save(task)
         return review(config, state, identifier, recover=task["status"] == "reviewing")
     return state.get(str(identifier))
