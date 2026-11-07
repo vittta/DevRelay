@@ -7,9 +7,15 @@ branch_prefix = "devrelay/task-"
 repository = "vittta/DevRelay"
 
 [queue]
+allowed_authors = ["vittta"]
+mode = "manual"
 approval_label = "auto:approved"
 priorities = ["priority:P0", "priority:P1", "priority:P2"]
 blockers = ["blocked", "needs-input"]
+
+[discovery]
+enabled = true
+auto_triage = false
 
 [codex]
 executable = "codex"

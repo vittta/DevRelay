@@ -20,13 +20,20 @@ class QueueTests(RepositoryTest):
     def report(self, tasks, claimed=(), integrated=()):
         return queue_report(self.config, Snapshot(tasks, set(claimed), set(integrated)))
 
-    def test_explicit_approval_and_unique_priority_are_required(self):
-        for labels in (["research", "priority:P1"], ["auto:approved"],
+    def test_approval_is_required_and_conflicting_priorities_are_rejected(self):
+        for labels in (["research", "priority:P1"],
                        ["auto:approved", "priority:P0", "priority:P1"],
                        ["auto:approved", "priority:P1", "blocked"],
                        ["auto:approved", "priority:P1", "needs-input"]):
             with self.subTest(labels=labels):
                 self.assertIsNone(self.report([issue(1, labels=labels)])["selected"])
+
+    def test_approved_plain_issue_uses_normal_priority_without_dependencies(self):
+        plain = issue(1, labels=["auto:approved"], body="Deliver one observable fix")
+        urgent = issue(2, labels=["auto:approved", "priority:P0"])
+        later = issue(3, labels=["auto:approved", "priority:P2"])
+        self.assertEqual([item["id"] for item in self.report([later, plain, urgent])["eligible"]], ["2", "1", "3"])
+        self.assertEqual(dependencies(plain["body"]), [])
 
     def test_priority_then_creation_time(self):
         tasks = [issue(1, created="2026-10-09T01:00:00Z"), issue(2),
@@ -78,7 +85,7 @@ class QueueTests(RepositoryTest):
     def test_cycle_unknown_and_malformed_dependencies_explained(self):
         for tasks, reason in (([issue(1, body="Depends on: #2")], "Unknown dependency"),
                               ([issue(1, body="Depends on: #1")], "Dependency cycle"),
-                              ([issue(1, body="")], "Exactly one"),
+                              ([issue(1, body="Depends on: none\nDepends on: none")], "at most one"),
                               ([issue(1, body="Depends on: #2, #2")], "Duplicate")):
             with self.subTest(reason=reason):
                 report = self.report(tasks)

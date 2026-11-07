@@ -27,8 +27,7 @@ class WorkerFixture(GitHubDeliveryFixture):
         self.events = []
         executable = Path(self.config.data["codex"]["executable"])
         # Each task must have its own implementation and review sessions.
-        executable.write_text(executable.read_text().replace("'exact-test-session'", "'worker-session-' + Path.cwd().name")
-                              .replace("'fresh-review-session'", "'worker-review-' + Path.cwd().name"))
+        executable.write_text(executable.read_text().replace("'exact-test-session'", "'worker-session-' + Path.cwd().name"))
 
     def inventory(self, config, *argv):
         if argv[0] == "issue":
@@ -48,6 +47,9 @@ class WorkerFixture(GitHubDeliveryFixture):
                 "autoMergeRequest": None}
 
     def pull_write(self, config, *argv, input=None):
+        if argv[1] == "edit":
+            self.edit_count += 1
+            return ""
         if argv[1] != "create":
             raise AssertionError("Worker must not merge or mark PRs ready")
         identifier = argv[argv.index("--head") + 1].removeprefix("devrelay/task-")

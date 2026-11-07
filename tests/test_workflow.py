@@ -415,10 +415,10 @@ class WorkflowTests(RepositoryTest):
             submit(self.config, self.state, "fix-1", local=True)
         self.assertEqual(self.git("log", "--format=%s", "-1", cwd=task["worktree"]), "project config")
 
-    def test_configuration_drift_rejects_submission(self):
+    def test_check_configuration_drift_rejects_submission(self):
         self.run_task()
         path = self.root / ".devrelay/config.toml"
-        path.write_text(path.read_text().replace("max_attempts = 2", "max_attempts = 3"))
+        path.write_text(path.read_text().replace('id = "checks-0"', 'id = "changed-acceptance"'))
         config = load(self.root)
         with self.state.lock(), self.assertRaisesRegex(RelayError, "stale"):
             submit(config, self.state, "fix-1", local=True)
@@ -538,7 +538,7 @@ class WorkflowTests(RepositoryTest):
         from devrelay import runner
         trace = Path(self.temporary.name) / "submission-trace"
         with (patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}),
-              patch.object(runner, "submit", side_effect=RelayError("PR request timed out")),
+              patch("devrelay.workflow.submit", side_effect=RelayError("PR request timed out")),
               self.assertRaisesRegex(RelayError, "PR request")):
             self.run_task(submit_after=True)
         self.assertEqual(len(trace.read_text().splitlines()), 1)

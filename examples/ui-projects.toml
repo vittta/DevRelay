@@ -1,0 +1,14 @@
+# Independent projects in one local dashboard. Paths are relative to this file.
+# This is not a multi-repository task workspace manifest.
+[[projects]]
+id = "app"
+name = "Application"
+path = "../my-app"
+
+[[projects]]
+id = "service"
+name = "Service"
+path = "../my-service"
+# Optional directory containing the selected runtime's devrelay/ Python package.
+# Omit to use the dashboard's runtime. No runtime is automatically upgraded.
+runtime = "../pinned-devrelay/src"

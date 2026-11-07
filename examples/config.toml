@@ -7,27 +7,46 @@ remote = "origin"
 branch_prefix = "devrelay/task-"
 
 [queue]
+allowed_authors = ["your-github-login", "your-autodev-login"] # Case-insensitive; omit or [] to allow any author.
+mode = "manual" # autonomous: extend automatic triage to human Issues too.
+auto_kinds = ["bug"] # Allowed: bug, feature, maintenance; plans remain non-executable.
+scope = "Fix confirmed bugs with clear expected behavior and bounded acceptance."
+max_dispatches = 20 # Autonomous triage/work stages; durable across watch restarts.
 # init creates missing labels; templates never pre-apply authorization or priorities.
 # init --sync-github honors customized queue label names without overwriting existing labels/files.
 approval_label = "auto:approved"
 priorities = ["priority:P0", "priority:P1", "priority:P2"]
+# Priority is optional; absent means the second configured priority (first if only one).
+# Omitted Depends on means no dependencies. Explicit declarations must remain valid.
 blockers = ["blocked", "needs-input"]
 
 [codex]
-# Optional run/resume/watch and AI review only. External agents use their own host/model;
+# Optional work/run/resume/watch and AI review only. External agents use their own host/model;
 # omit this table when using only next/start/prepare/check/submit with AI delivery disabled.
 executable = "codex"
 sandbox = "workspace-write"
 timeout_seconds = 1800
 max_attempts = 2
+# work/watch share this total implementation + repair budget across restarts.
 # model = "your-configured-model"
 # profile = "your-codex-profile"
 
+[discovery]
+# Collect independent bugs during implementation/review by default; false opts out.
+enabled = true
+# Default source policy, even in manual projects; only controller-created discoveries qualify.
+auto_triage = true
+auto_review = true
+# Cumulative distinct findings per source task, including retries (1–20).
+max_per_task = 3
+
 [delivery]
-auto_review = false
+auto_review = false # All PRs; discovery.auto_review separately enables discovery PR review.
 # true: watch waits for protected merge and post-merge acceptance before the next issue.
 # false: watch delivers draft PRs for manual integration.
 auto_merge = false
+# Keep true to rerun setup/checks after merge; false still checks merge identity/tree.
+post_merge_checks = true
 cleanup_worktrees = false
 # Removes local, remote and remote-tracking task branches; requires cleanup_worktrees=true.
 cleanup_branches = false

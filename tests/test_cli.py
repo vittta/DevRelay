@@ -2,6 +2,7 @@ from contextlib import chdir, redirect_stderr, redirect_stdout
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -97,6 +98,21 @@ class VersionTests(unittest.TestCase):
 
 
 class CliTests(RepositoryTest):
+    def test_work_delivers_local_task_and_status_explains_next_action(self):
+        self.configure(executable=self.fake_codex())
+        file = Path(self.temporary.name) / "task.md"
+        file.write_text("Fix one bounded behavior")
+        self.assertEqual(self.invoke("task", "add", "fix", "--title", "Fix value", "--file", str(file))[0], 0)
+        code, result = self.invoke("work", "fix")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["status"], "committed")
+        self.assertEqual(result["next_action"]["kind"], "delivered")
+        code, status = self.invoke("status")
+        self.assertEqual(status["tasks"][0]["next_action"]["kind"], "delivered")
+        code, error = self.invoke("work", "--retry")
+        self.assertEqual(code, 1)
+        self.assertIn("requires a task ID", error["error"])
+
     def invoke(self, *argv, project=None):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -113,6 +129,42 @@ class CliTests(RepositoryTest):
         code, result = self.invoke("init")
         self.assertEqual(code, 1)
         self.assertIn("already exists", result["error"])
+
+    def test_doctor_checks_current_github_credentials_despite_inactive_account_failure(self):
+        self.configure(provider="github", executable=self.fake_codex())
+        self.state.set_metadata("controller_root", str(self.root))
+        self.git("remote", "add", "origin", "https://github.com/example/project.git")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        run, which = subprocess.run, shutil.which
+        api = ["gh", "api", "--hostname", "github.com", "user", "--silent"]
+        outcomes = (0, 1, FileNotFoundError("gh unavailable"), subprocess.TimeoutExpired(api, 15))
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                calls = []
+
+                def gh_run(argv, **kwargs):
+                    if argv[0] != "gh":
+                        return run(argv, **kwargs)
+                    calls.append(argv)
+                    # A stale inactive account makes the all-account check fail.
+                    if argv[1:3] == ["auth", "status"]:
+                        return subprocess.CompletedProcess(argv, 1, "", "Inactive account expired")
+                    self.assertEqual(argv, api)
+                    self.assertEqual(kwargs["timeout"], 15)
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return subprocess.CompletedProcess(argv, outcome, "", "")
+
+                with (patch("devrelay.cli.subprocess.run", side_effect=gh_run),
+                      patch("devrelay.cli.shutil.which", side_effect=lambda name: "/test/gh" if name == "gh" else which(name))):
+                    code, report = self.invoke("doctor")
+                expected = outcome == 0
+                self.assertEqual(code, 0 if expected else 1, report)
+                self.assertEqual(report["ready"], expected)
+                checks = {item["id"]: item["ok"] for item in report["checks"]}
+                self.assertEqual(checks.pop("github_login"), expected)
+                self.assertTrue(all(checks.values()), checks)
+                self.assertEqual(calls, [api])
 
     def test_cli_runs_an_offline_task_and_routes_calls_from_its_worktree(self):
         self.configure(executable=self.fake_codex())

@@ -32,6 +32,22 @@ DevRelay 为外层 Agent 提供工程工具。Agent 决定调查方向、实现�
 
 ## Engineering loop / 工程循环
 
+In `queue.mode=autonomous`, `next.triage_candidates` identifies unapproved Issues
+needing investigation. Use `triage ID --prepare`, read `prompt.txt` and
+`result-schema.json` in the returned `triage.context.run`, investigate in
+`triage.context.worktree`, then submit `triage ID --file RESULT.json`. Echo the
+context hash. No model is launched by these two tools. The controller validates
+the report and applies project policy; `ready` admits the normal engineering loop,
+`needs_input` asks concrete questions, and `skip` retains a non-executable diagnosis.
+Do not add an approval label yourself to bypass a rejected diagnosis. Managed
+`triage ID` / `work` / `watch` use the same gate. Put human decisions into the Issue
+body; comments are not consumed. Changed requirements and policy expire the decision.
+
+自动模式下先读取 `next.triage_candidates`，用 `triage ID --prepare` 准备独立调查工作树，
+按返回目录中的 prompt 和 schema 调查后提交结果。控制器按项目策略判断能否进入实现，
+不需要外层 Agent 自己给任务加授权标签。`needs_input` 提供明确待决问题，`skip` 保留
+诊断但不自动关闭 Issue。人把决定写入正文后可重新分诊；内容和策略变化使旧结论失效。
+
 Run commands from the project controller checkout, keeping `--project` explicit when
 working elsewhere. Parse JSON output; use the returned `worktree`, not a guessed path.
 
@@ -58,6 +74,8 @@ devrelay --project /path/to/project submit 12
 | `prepare ID` | Run configured setup, retaining logs; every invocation invalidates old checks / 执行配置的环境准备并保存日志，每次使旧验收失效 |
 | `check ID` | Run acceptance and inspect failures; repair then recheck / 执行验收，失败时读取证据、修复并重验 |
 | `submit ID` | Require current evidence, then deliver under project policy / 用有效证据按项目策略交付 |
+| `triage ID --prepare` / `--file RESULT.json` | Investigate and report under automatic project policy / 按项目自动策略调查并提交结论 |
+| `discover ID --file reports.json` | Report follow-ups into the project's manual/automatic intake / 上报独立新问题，进入项目授权或分诊流程 |
 
 Preparation operates on a claimed, unfinished task, including a
 local commit or an open PR, and never starts an agent. Existing PR identity and state
@@ -99,12 +117,56 @@ Codex 并推进交付。显式 `review` 也调用 Codex，用 `doctor --with-cod
 本地完成会核对最新验收源码与交付提交一致、工作树未变化、要求与配置一致且提交已集成。
 仅重新验收不能交付新增内容或解锁依赖。
 
+## Discover follow-ups / 发现后续任务
+
+During implementation or QA, record independently actionable out-of-scope bugs using
+`discover SOURCE_ID --file reports.json`. Each JSON-array entry has `title`,
+`description`, `evidence` and `acceptance`; include actual reproduction or precise
+code evidence, never credentials or private data. Keep current regressions, missing
+acceptance and unfinished scope in the original task. A report is not a passed check.
+The controller deduplicates and publishes the task, retaining source provenance;
+it never grants an approval label. Apply authorization only within the maintainer's
+existing authority. Controller-created discoveries default to independent triage
+(`discovery.auto_triage=true`) even in manual projects; their PRs default to automatic
+review (`discovery.auto_review=true`). The existing global merge switch still applies.
+Opting out of discovery triage in a manual project restores per-task approval.
+An existing human Issue matched as a duplicate does not inherit this source policy.
+
+实现或 QA 中发现有证据且范围独立的新问题时，用 `discover 来源ID --file reports.json`
+上报。JSON 数组每项包含 `title`、`description`、`evidence`、`acceptance`；记录实际复现
+或精确代码证据，不包含凭据与私密数据。本次回归、未完成范围和缺失验收仍留在原任务。
+控制器去重、创建任务并保存来源，不添加授权标签；新建的发现任务默认独立分诊，符合范围
+后执行并自动审查 PR，人工模式也适用。合并仍由全项目开关控制。重复匹配到的已有人工
+Issue 不继承此来源策略；显式关闭发现自动分诊后，人工模式需逐条授权。
+
+Managed implementation/review turns collect these reports by default
+(`discovery.enabled = true`); set it to `false` to opt out. No separate audit is launched. Inspect `discoveries`
+and `discovery_error` in `status`. Use `discover ID` to reconcile or retry saved
+reports. An uncertain creation request is not resent unless `--retry-create` is
+explicit after checking GitHub. This recovery is separate from the source task's
+implementation retry budget and does not weaken its delivery result.
+
 ## Recovery and optional orchestration / 恢复与可选编排
+
+Read `status.tasks[].next_action`: actionable failed checks and review findings belong
+to the implementation agent; handoffs explain missing input, evidence problems or an
+exhausted managed budget. Low-level tools never silently take over implementation.
+Once the external editor has stopped, `work ID` may manage continuation through checks,
+bounded repair and configured delivery. `work ID --retry` explicitly opens another
+budget after resolving a handoff. `run --submit`, `resume --submit` and `watch` share
+this loop; `resume --submit` is an explicit retry. Review cannot replace behavioral QA:
+put project-specific acceptance, including browser/end-to-end checks, in `[[checks]]`.
+
+读取 `next_action` 获得可操作反馈：检查失败和可修复的审查意见交回实现 Agent；外部输入、
+证据问题和托管预算耗尽通过 handoff 说明。停止外层编辑后，可用 `work ID` 接管任务推进，
+解决原因后用 `work ID --retry` 明确开启新预算。源码、base 或要求改变须重验；配置变化
+只影响对应阶段。模型/profile 改变只重新审查，不强制重装环境或重跑仍有效的本地验收。
 
 The external host owns its agent session and a checkpoint linking the goal, task ID,
 worktree and evidence. DevRelay stores tool state and receipts, not that conversation.
 On recovery inspect `status`, actual files, base and evidence before retrying a tool.
-Changed source, base, configuration or requirements require fresh acceptance.
+Changed source, base or requirements require fresh acceptance; configuration changes
+invalidate only the affected stages described above.
 
 The repository lock covers tool execution only. It does not reserve an external
 editor between calls. The host must enforce one active implementation owner and
@@ -114,7 +176,7 @@ implementation session; it does not recover the external host's conversation.
 
 外层宿主负责会话和关联目标、任务 ID、工作树与证据的检查点。DevRelay 保存工具状态和
 回执，不保存外层对话。恢复先检查 `status`、实际文件、目标分支和证据；源码、base、
-配置或要求改变后重新验收。仓库锁仅覆盖工具执行，不保留两次调用之间的编辑独占权。
+要求改变后重新验收；配置变化按上述阶段处理。仓库锁仅覆盖工具执行，不保留两次调用之间的编辑独占权。
 宿主须保证同一任务只有一个实现者，交给可选 `run/resume/watch` 前停止原编辑者。
 DevRelay 不检测任意外层 Agent；`resume` 只恢复 DevRelay 自己启动的 Codex 实现会话。
 

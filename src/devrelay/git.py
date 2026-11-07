@@ -221,7 +221,7 @@ def _isolated_source_tree(root, *, inspect_submodules, neutralize_config=False):
 
 
 def source_tree(root):
-    return _isolated_source_tree(root, inspect_submodules=True)
+    return _isolated_source_tree(Path(root), inspect_submodules=True)
 
 
 def stage_submodule_gitlinks(root):

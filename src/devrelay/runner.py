@@ -6,6 +6,7 @@ import re
 import uuid
 
 from . import codex
+from .discovery import capture
 from .config import load
 from .errors import RelayError
 from .git import (command, git, has_ref, is_ancestor, pinned_transport, remote_tracking_ref,
@@ -13,6 +14,7 @@ from .git import (command, git, has_ref, is_ancestor, pinned_transport, remote_t
 from .process import execute
 from .providers import authorized, gh, gh_json, queue_report, snapshot, task_id
 from .state import now
+from .triage import autonomous, automatic, automatic_enabled, authorization_reason, scope_digest, triage
 
 
 def assert_config(config):
@@ -21,8 +23,20 @@ def assert_config(config):
 
 
 def require_prepared(config, task):
-    if config.data["setup"] and task.get("setup_fingerprint") != config.fingerprint:
+    if config.data["setup"] and not prepared(config, task):
         raise RelayError(f"Project setup is missing or stale; run devrelay prepare {task['id']} before acceptance or delivery")
+
+
+def prepared(config, task):
+    return config.matches_evidence({"config_sha256": task.get("setup_fingerprint"),
+                                    **({"setup_sha256": task["setup_sha256"]} if "setup_sha256" in task else {})}, "setup")
+
+
+def publication_heads(task):
+    allowed = {task.get("published_head", task.get("head_sha"))}
+    if (intent := task.get("push_intent")) and intent["previous_sha"] in allowed:
+        allowed.add(intent["head_sha"])
+    return allowed - {None}
 
 
 def editable_task(config, task):
@@ -33,9 +47,9 @@ def editable_task(config, task):
         validate_remote(config)
         pull = pull_snapshot(config, task)
         if (pull["state"] != "OPEN" or pull["headRefName"] != task["branch"]
-                or pull["headRefOid"] != task.get("head_sha") or pull["baseRefName"] != config.base
-                or pull["isCrossRepository"]):
-            raise RelayError("PR is closed, merged or differs from the saved submission; recover delivery before preparation")
+                or pull["headRefOid"] not in publication_heads(task) or pull["baseRefName"] != config.base
+                or pull["isCrossRepository"] or pull.get("autoMergeRequest") or pull.get("mergeQueueEntry")):
+            raise RelayError("PR is closed, merged or differs from the saved submission, or has a pending merge; recover PR identity/state before preparation")
 
 
 def submission_evidence(config, state, task, record, *, head=None):
@@ -45,8 +59,9 @@ def submission_evidence(config, state, task, record, *, head=None):
     fresh = authorized(config, state, task["id"])
     path = Path(task["worktree"])
     if (not record or not record.get("passed") or record["source_tree"] != source_tree(path)
-            or record["config_sha256"] != config.fingerprint or record["base_sha"] != base_commit(config)
-            or record["task_body"] != fresh["body"] or record["task_title"] != fresh["title"]):
+            or not config.matches_evidence(record, "checks") or record["base_sha"] != base_commit(config)
+            or record["task_body"] != fresh["body"] or record["task_title"] != fresh["title"]
+            or record.get("scope_sha256") != scope_digest(config, fresh)):
         raise RelayError("Verification is missing or stale; task requirements/source/configuration/base may have changed; run devrelay check before submitting")
     if head is not None and git(path, "rev-parse", "HEAD") != head:
         raise RelayError("HEAD changed before publication; rerun verification")
@@ -63,6 +78,7 @@ def base_commit(config):
 
 
 def claimed_task(config, state, identifier):
+    from .discovery import attach_sources
     task = state.get(task_id(identifier))
     if not task or not task.get("worktree"):
         raise RelayError(f"Task {identifier} has no worktree; run devrelay start {identifier}")
@@ -76,7 +92,7 @@ def claimed_task(config, state, identifier):
     if not any(Path(item["worktree"]).resolve() == path.resolve()
                and item.get("branch") == "refs/heads/" + task["branch"] for item in records):
         raise RelayError("Worktree is not registered with this repository")
-    return task
+    return attach_sources(config, state, [task])[0]
 
 
 def start(config, state, identifier):
@@ -98,7 +114,7 @@ def start(config, state, identifier):
     if path.exists():
         raise RelayError(f"Unregistered worktree directory exists: {path}; left unchanged")
     git(config.root, "check-ref-format", "--branch", branch)
-    task = {**task, "status": "claimed", "branch": branch, "worktree": str(path),
+    task = {**(saved or {}), **task, "status": "claimed", "branch": branch, "worktree": str(path),
             "base_sha": base, "attempts": (saved or {}).get("attempts", 0)}
     state.save(task)  # Persist ownership before creating the worktree.
     try:
@@ -118,6 +134,7 @@ def prepare(config, state, task):
     editable_task(config, task)
     task["status"] = "preparing"
     task["setup_fingerprint"] = None
+    task.pop("setup_sha256", None)
     task["verification"] = None
     task["review"] = None
     task["merge_gates"] = None
@@ -139,6 +156,7 @@ def prepare(config, state, task):
         state.save(task)
         raise
     task["setup_fingerprint"] = config.fingerprint
+    task["setup_sha256"] = config.stage_fingerprint("setup")
     task["status"] = "prepared"
     task["error"] = None
     return state.save(task)
@@ -148,7 +166,7 @@ def prepare_task(config, state, identifier):
     """Explicit setup for an external agent; never start a Codex session."""
     task = claimed_task(config, state, identifier)
     fresh = authorized(config, state, identifier)
-    task.update({key: fresh[key] for key in ("body", "title", "labels")})
+    task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
     return prepare(config, state, task)
 
 
@@ -158,7 +176,7 @@ def verify(config, state, identifier):
     task = claimed_task(config, state, identifier)
     require_prepared(config, task)
     fresh = authorized(config, state, identifier)
-    task.update({key: fresh[key] for key in ("body", "title", "labels")})
+    task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
     path = Path(task["worktree"])
     base = base_commit(config)
     if not is_ancestor(path, base, "HEAD"):
@@ -170,6 +188,7 @@ def verify(config, state, identifier):
     task["status"] = "verifying"
     task["verification"] = None
     task["verification_path"] = str(directory / "verification.json")
+    task.pop("failure", None)
     state.save(task)
     results = []
     try:
@@ -184,41 +203,54 @@ def verify(config, state, identifier):
         if base_commit(config) != base:
             raise RelayError("Target base changed during verification; integrate it and rerun")
         latest = authorized(config, state, identifier)
-        if latest["body"] != fresh["body"] or latest["title"] != fresh["title"]:
+        if (latest["body"] != fresh["body"] or latest["title"] != fresh["title"]
+                or scope_digest(config, latest) != scope_digest(config, fresh)):
             raise RelayError("Task requirements changed during verification; resume and revalidate")
         if source_tree(path) != before or git(path, "rev-parse", "HEAD") != head:
             raise RelayError("Source or HEAD changed while finalizing verification; rerun the checks")
     except (RelayError, OSError, KeyboardInterrupt) as error:
         message = str(error) or "Interrupted"
         task.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed", error=message)
+        if not isinstance(error, KeyboardInterrupt):
+            task["failure"] = {"kind": "checks", "message": message, "logs": str(directory)}
         state.save(task)
         (directory / "verification.json").write_text(json.dumps({"passed": False, "error": message, "checks": results}, indent=2))
         raise
     record = {"passed": True, "source_tree": before, "head_sha": head, "base_sha": base,
               "config_sha256": config.fingerprint, "task_body": fresh["body"], "task_title": fresh["title"],
+              "checks_sha256": config.stage_fingerprint("checks"), "scope_sha256": scope_digest(config, fresh),
               "checks": results, "finished_at": now()}
     receipt_path = directory / "verification.json"
     receipt_path.write_text(json.dumps(record, indent=2) + "\n")
     task.update(status="verified", verification=record, verification_path=str(receipt_path), base_sha=base, error=None)
+    for key in ("handoff", "failure", "repair_feedback"):
+        task.pop(key, None)
     return state.save(task)
 
 
 def run_task(config, state, identifier=None, *, resume=False, submit_after=False):
+    if submit_after:
+        from .workflow import work
+        return work(config, state, identifier, retry=resume)
+    return implement_task(config, state, identifier, resume=resume)
+
+
+def implement_task(config, state, identifier=None, *, resume=False, allow_pr=False, feedback=None, max_attempts=None):
     if not config.data["checks"]:
         raise RelayError("Configure at least one [[checks]] before running an AI task")
-    if resume and submit_after and (state.get(str(identifier)) or {}).get("pr_url"):
-        from .delivery import advance
-        return advance(config, state, identifier)
+    if autonomous(config) and not allow_pr and identifier is None:
+        from .worker import selection
+        selected = selection(config, state)
+        if selected["status"] != "selected":
+            return selected
+        identifier = selected["id"]
+        resume = bool((state.get(identifier) or {}).get("worktree"))
     if identifier is None:
         delivery_attention = [item["id"] for item in state.tasks()
                               if item["status"] in ("review_blocked", "merge_blocked", "post_merge_failed", "cleanup_failed")]
         if delivery_attention:
             return {"status": "needs_attention", "tasks": delivery_attention,
                     "message": "Inspect review/merge/post-merge evidence before dispatching new work"}
-        pending = [item for item in state.tasks() if item.get("pr_url") and item["status"] != "completed"]
-        if submit_after and pending and (config.data["delivery"]["auto_review"] or config.data["delivery"]["auto_merge"]):
-            from .delivery import advance
-            return advance(config, state, sorted(pending, key=lambda item: item["created_at"])[0]["id"])
         interrupted = [item for item in state.tasks() if item["status"] in ("claimed", "prepared", "preparing", "implementing", "verifying", "interrupted")]
         if interrupted:
             identifier = sorted(interrupted, key=lambda item: item["created_at"])[0]["id"]
@@ -228,31 +260,39 @@ def run_task(config, state, identifier=None, *, resume=False, submit_after=False
             if attention:
                 return {"status": "needs_attention", "tasks": attention,
                         "message": "Inspect saved errors and explicitly resume these tasks before new automatic dispatch"}
-            selected = queue_report(config, snapshot(config, state))["selected"]
+            report = queue_report(config, snapshot(config, state))
+            selected = report["selected"] or next(iter(report.get("triage_candidates", [])), None)
             if selected is None:
                 return {"status": "idle", "message": "No eligible task"}
             identifier = selected["id"]
+    if automatic_enabled(config) and not allow_pr:
+        fresh = next((task for task in snapshot(config, state).tasks if task["id"] == str(identifier)), None)
+        if fresh and automatic(config, fresh) and authorization_reason(config, fresh):
+            investigated = triage(config, state, identifier)
+            if investigated["triage"]["result"]["decision"] != "ready":
+                return investigated
     if resume and (state.get(str(identifier)) or {}).get("status") in ("claimed", "start_failed"):
         task = start(config, state, identifier)
     else:
         task = claimed_task(config, state, identifier) if resume else start(config, state, identifier)
-    if task.get("pr_url"):
-        if resume and submit_after:
-            from .delivery import advance
-            return advance(config, state, identifier)
+    if task.get("pr_url") and not allow_pr:
         raise RelayError(f"Task {identifier} already has a PR; use check/submit, review or merge")
     if task["status"] == "completed":
         raise RelayError(f"Task {identifier} is already {task['status']}; inspect status instead")
     fresh = authorized(config, state, identifier)
-    task.update({key: fresh[key] for key in ("body", "title", "labels")})
-    feedback = task.get("error", "")
+    task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
+    if allow_pr:
+        editable_task(config, task)
+    feedback = feedback if feedback is not None else task.get("error", "")
+    limit = max_attempts or config.data["codex"]["max_attempts"]
     try:
-        if task.get("setup_fingerprint") != config.fingerprint:
+        if not prepared(config, task):
             task = prepare(config, state, task)
-        for attempt in range(config.data["codex"]["max_attempts"]):
+        for attempt in range(limit):
             fresh = authorized(config, state, identifier)
-            task.update({key: fresh[key] for key in ("body", "title", "labels")})
+            task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
             task.update(status="implementing", attempts=task.get("attempts", 0) + 1, verification=None)
+            task.pop("failure", None)
             state.save(task)
             directory = state.directory / "runs" / task["id"] / (uuid.uuid4().hex + "-codex")
             before_head = git(task["worktree"], "rev-parse", "HEAD")
@@ -261,6 +301,7 @@ def run_task(config, state, identifier=None, *, resume=False, submit_after=False
             if git(task["worktree"], "rev-parse", "HEAD") != before_head:
                 raise RelayError("Codex changed Git history; preserve its work and review before continuing")
             assert_config(config)
+            task = capture(config, state, task, result, origin="implementation", report_path=directory / "result.json")
             if result["outcome"] == "blocked":
                 task.update(status="blocked", error="; ".join(result["blockers"]) or result["summary"])
                 return state.save(task)
@@ -269,13 +310,13 @@ def run_task(config, state, identifier=None, *, resume=False, submit_after=False
                 task = verify(config, state, task["id"])
             except RelayError as error:
                 feedback = str(error)
-                if attempt + 1 >= config.data["codex"]["max_attempts"]:
+                if attempt + 1 >= limit:
                     raise
                 task = claimed_task(config, state, identifier)
                 fresh = authorized(config, state, identifier)
-                task.update({key: fresh[key] for key in ("body", "title", "labels")})
+                task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
                 continue
-            return submit(config, state, task["id"]) if submit_after else task
+            return task
     except (RelayError, KeyboardInterrupt) as error:
         task = state.get(str(identifier)) or task
         if not task.get("pr_url"):
@@ -337,12 +378,9 @@ def submission_pull(config, state, task, *, heads=None):
                 ("url", "state", "headRefName", "headRefOid", "baseRefName")):
             raise RelayError("GitHub returned incomplete PR identity; preserve delivery and inspect GitHub")
         merge_state = submission_merge_state(config, state, task, match[2])
-        allowed = heads if heads is not None else {task.get("published_head", task.get("head_sha"))}
-        intent = task.get("push_intent")
-        if heads is None and intent and intent["previous_sha"] in allowed:
-            allowed.add(intent["head_sha"])
+        allowed = heads if heads is not None else publication_heads(task)
         if (pull.get("url", "").casefold() != url.casefold() or pull.get("state") != "OPEN"
-                or pull.get("headRefName") != task["branch"] or pull.get("headRefOid") not in allowed - {None}
+                or pull.get("headRefName") != task["branch"] or pull.get("headRefOid") not in allowed
                 or pull.get("baseRefName") != config.base or pull.get("isCrossRepository") is not False
                 or "autoMergeRequest" not in pull or pull["autoMergeRequest"] is not None
                 or merge_state["mergeQueueEntry"] is not None or merge_state["autoMergeRequest"] is not None
@@ -369,8 +407,8 @@ def submit(config, state, identifier, *, local=False):
         return advance(config, state, identifier)
     task = claimed_task(config, state, identifier)
     if task.get("pr_url") and task["status"] not in ("verified", "committed") and not local:
-        from .delivery import advance
-        if not (config.data["delivery"]["auto_review"] or config.data["delivery"]["auto_merge"]):
+        from .delivery import advance, automatic_review
+        if not automatic_review(config, task):
             validate_remote(config)
             submission_pull(config, state, task)
             submission_evidence(config, state, task, task.get("verification"), head=task.get("head_sha"))
@@ -453,6 +491,7 @@ def complete_local(config, state, identifier):
     head = task.get("head_sha")
     if (not head or not record.get("passed") or record.get("config_sha256") != config.fingerprint
             or record.get("task_body") != fresh["body"] or record.get("task_title") != fresh["title"]
+            or record.get("scope_sha256") != scope_digest(config, fresh)
             or git(path, "rev-parse", "HEAD") != head
             or git(path, "rev-parse", head + "^{tree}") != record.get("source_tree")
             or source_tree(path) != record.get("source_tree")):

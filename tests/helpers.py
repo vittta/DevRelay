@@ -78,10 +78,29 @@ if trace:
         f.write(json.dumps({'argv': args, 'cwd': str(Path.cwd()), 'prompt': prompt}) + '\\n')
 destination = Path(args[args.index('--output-last-message') + 1])
 schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())
+if 'decision' in schema['properties']:
+    task = json.loads(next(line.removeprefix('Task (JSON): ') for line in prompt.splitlines() if line.startswith('Task (JSON): ')))
+    context = json.loads(next(line.removeprefix('Investigation context: ') for line in prompt.splitlines() if line.startswith('Investigation context: ')))
+    decision = json.loads(os.environ.get('DEVRELAY_TEST_TRIAGE_BY_ID', '{}')).get(task['id'], os.environ.get('DEVRELAY_TEST_TRIAGE', 'ready'))
+    session = os.environ.get('DEVRELAY_TEST_TRIAGE_SESSION', 'triage-session-' + __import__('uuid').uuid4().hex)
+    print(json.dumps({'type': 'thread.started', 'thread_id': session}), flush=True)
+    if decision == 'failure':
+        print(json.dumps({'type': 'turn.failed'}), flush=True)
+        raise SystemExit(9)
+    result = {'context_sha256': context['context_sha256'], 'decision': decision,
+              'kind': os.environ.get('DEVRELAY_TEST_TRIAGE_KIND', 'bug'),
+              'summary': 'Investigated bounded behavior',
+              'evidence': 'Read value.txt on the unchanged base: ' + Path('value.txt').read_text().strip(),
+              'acceptance': 'value.txt contains fixed with a trailing newline',
+              'questions': ['Which expected behavior should this implement? Choose fixed or unchanged.'] if decision == 'needs_input' else [],
+              'duplicate_of': ''}
+    destination.write_text(json.dumps(result))
+    print(json.dumps({'type': 'turn.completed'}), flush=True)
+    raise SystemExit(0)
 if 'verdict' in schema['properties']:
     review_mode = os.environ.get('DEVRELAY_TEST_REVIEW', 'approve')
     print(json.dumps({'type': 'thread.started', 'thread_id':
-        'exact-test-session' if review_mode == 'same-session' else 'fresh-review-session'}), flush=True)
+        'exact-test-session' if review_mode == 'same-session' else 'fresh-review-session' + __import__('uuid').uuid4().hex}), flush=True)
     if review_mode == 'failure':
         print(json.dumps({'type': 'turn.failed'}))
         raise SystemExit(9)
@@ -92,6 +111,8 @@ if 'verdict' in schema['properties']:
               'findings': ['Fix the reported regression'] if review_mode in ('changes_requested', 'blocked') else []}
     if review_mode == 'inconsistent':
         result['findings'] = ['Blocking issue']
+    if 'discoveries' in schema['properties']:
+        result['discoveries'] = json.loads(os.environ.get('DEVRELAY_TEST_REVIEW_DISCOVERIES', '[]'))
     destination.write_text('invalid json' if review_mode == 'invalid' else json.dumps(result))
     if review_mode != 'incomplete':
         print(json.dumps({'type': 'turn.completed'}), flush=True)
@@ -129,6 +150,8 @@ if mode != 'blocked':
 result = {'outcome': 'blocked' if mode == 'blocked' else 'ready',
           'summary': 'Missing dataset' if mode == 'blocked' else 'Fixed the bounded behavior',
           'blockers': ['Provide dataset'] if mode == 'blocked' else []}
+if 'discoveries' in schema['properties']:
+    result['discoveries'] = json.loads(os.environ.get('DEVRELAY_TEST_DISCOVERIES', '[]'))
 destination.write_text('invalid json' if mode == 'bad-result' else json.dumps(result))
 if mode != 'no-completed-turn':
     print(json.dumps({'type': 'turn.completed'}), flush=True)

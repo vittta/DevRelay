@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from devrelay.cli import doctor, main, probe
 from devrelay.config import load
+from devrelay.project_registry import Registry
 
 from helpers import RepositoryTest
 
@@ -31,6 +32,7 @@ class AgentToolTests(RepositoryTest):
             sys.executable, "-c",
             "from pathlib import Path; p=Path('.devrelay/runtime/environment'); p.parent.mkdir(parents=True); p.write_text('ready')",
         ]])
+        Registry(Path(self.temporary.name) / "projects.toml").add(str(self.root))
         self.add_task()
         (self.root / "user-work.txt").write_text("Keep controller work")
         with patch("devrelay.runner.codex.implement", side_effect=AssertionError("Unexpected implementation agent")):
@@ -64,6 +66,7 @@ class AgentToolTests(RepositoryTest):
 
     def test_doctor_checks_codex_only_when_requested(self):
         self.configure(executable="/no-such-devrelay-codex")
+        Registry(Path(self.temporary.name) / "projects.toml").add(str(self.root))
         with patch("devrelay.cli.probe", wraps=probe) as calls:
             code, report = self.invoke("doctor")
             self.assertEqual(code, 0, report)
@@ -90,6 +93,7 @@ class AgentToolTests(RepositoryTest):
 
     def test_doctor_reports_missing_base_mapping_and_keeps_other_diagnostics(self):
         self.configure(provider="github")
+        self.state.set_metadata("controller_root", str(self.root))
         self.git("update-ref", "refs/remotes/origin/main", self.git("rev-parse", "HEAD"))
         with (patch("devrelay.cli.validate_remote"),
               patch("devrelay.cli.shutil.which", return_value="available"),
@@ -104,8 +108,20 @@ class AgentToolTests(RepositoryTest):
                          "Base main has no fetch tracking mapping for remote origin; "
                          "configure a positive fetch refspec before using this project")
         self.assertEqual(set(checks), {"git", "base", "acceptance", "git_identity", "codex",
-                                      "codex_login", "gh", "github_login", "remote_matches_repository"})
+                                      "codex_login", "gh", "github_login", "remote_matches_repository", "controller"})
         self.assertTrue(all(item["ok"] for key, item in checks.items() if key != "base"))
+
+    def test_github_default_discovery_review_requires_codex_but_can_be_disabled(self):
+        self.configure(provider="github", executable="/no-such-devrelay-codex")
+        with patch("devrelay.cli.validate_remote"), patch("devrelay.cli.probe", return_value=True):
+            report = doctor(self.config)
+            self.assertTrue(report["codex_required"])
+            self.assertFalse(report["ready"])
+            path = self.root / ".devrelay/config.toml"
+            path.write_text(path.read_text() + "\n[discovery]\nauto_review = false\n")
+            report = doctor(load(self.root))
+            self.assertFalse(report["codex_required"])
+            self.assertNotIn("codex", {item["id"] for item in report["checks"]})
 
     def test_prepare_failure_retains_work_and_can_be_retried(self):
         self.configure(executable="/no-such-devrelay-codex", setup=[[
